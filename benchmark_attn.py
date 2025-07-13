@@ -18,6 +18,8 @@ try:
 except ImportError:
     flash_attn = None
 
+from gn_kernels import triton_attn
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bs", type=int, default=4)
@@ -78,6 +80,8 @@ if __name__ == "__main__":
 
     if flash_attn is not None:
         bench(flash_attn, "flash-attn")
+
+    bench(triton_attn, "triton")
 
     df = pd.DataFrame(results, columns=["Kernel", "Latency (ms)", "TFLOPS", "% SOL"])
     print(df.to_markdown(index=False))
