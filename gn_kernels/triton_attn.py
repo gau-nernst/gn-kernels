@@ -5,22 +5,15 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-configs = [
-    triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
-    for BM in [64, 128]
-    for BN in [64, 128]
-    for s in [2, 3, 4]
-    for w in [4, 8]
-]
 
-
-@triton.autotune(configs, key=["LEN_Q", "LEN_KV", "HEAD_DIM"])
 @triton.jit
-def _attn_fwd(
+def attn_kernel(
     Q_ptr,  # [BS, LEN_Q, HEAD_DIM]
     K_ptr,  # [BS, LEN_KV, HEAD_DIM]
     V_ptr,  # [BS, LEN_KV, HEAD_DIM]
     O_ptr,  # [BS, LEN_Q, HEAD_DIM]
+    scale_Q_ptr,  # [BS, LEN_Q]
+    scale_K_ptr,  # [BS, LEN_KV]
     sm_scale,
     LEN_Q,
     LEN_KV,
@@ -77,13 +70,31 @@ def _attn_fwd(
     qk_scale *= 1.44269504  # 1/log(2)
 
     # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr)
+    q = tl.load(Q_block_ptr)  # [BLOCK_M, HEAD_DIM]
+
+    if scale_Q_ptr is not None:
+        offsets = pid_bs * LEN_Q + (pid_m * BLOCK_M) + tl.arange(0, BLOCK_M)[:, None]
+        qk_scale = qk_scale * tl.load(scale_Q_ptr + offsets)  # [BLOCK_M, 1]
+
+    if scale_K_ptr is not None:
+        scale_k_ptrs = scale_K_ptr + pid_bs * LEN_KV + tl.arange(0, BLOCK_N)[None, :]
+    else:
+        scale_k_ptrs = None
 
     # loop over k, v and update accumulator
     for _ in range(0, LEN_KV, BLOCK_N):
         # 1st matmul - q @ k.t
-        k = tl.load(K_block_ptr)
-        qk = tl.dot(q, k) * qk_scale
+        k = tl.load(K_block_ptr)  # [HEAD_DIM, BLOCK_N]
+
+        out_dtype = tl.int32 if q.type == tl.int8 else tl.float32
+        qk = tl.dot(q, k, out_dtype=out_dtype)  # [BLOCK_M, BLOCK_N]
+        qk = qk.to(tl.float32) * qk_scale
+
+        if scale_k_ptrs is not None:
+            # NOTE: this is not pipelined
+            scale_k = tl.load(scale_k_ptrs)  # [1, BLOCK_N]
+            qk *= scale_k
+            scale_k_ptrs += BLOCK_N
 
         # softmax
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -109,10 +120,23 @@ def _attn_fwd(
     tl.store(O_block_ptr, acc.to(O_ptr.type.element_ty))
 
 
+triton_attn_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
+        for BM in [64, 128]
+        for BN in [64, 128]
+        for s in [2, 3, 4]
+        for w in [4, 8]
+    ],
+    key=["LEN_Q", "LEN_KV", "HEAD_DIM"],
+)(attn_kernel)
+
+
 def triton_attn(q: Tensor, k: Tensor, v: Tensor):
     BS, nH, LEN_Q, HEAD_DIM = q.shape
     LEN_KV = k.shape[2]
-    assert k.shape[-1] == v.shape[-1] == HEAD_DIM
+    assert k.shape == (BS, nH, LEN_KV, HEAD_DIM)
+    assert v.shape == (BS, nH, LEN_KV, HEAD_DIM)
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -123,6 +147,43 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor):
     def grid(args):
         return (triton.cdiv(LEN_Q, args["BLOCK_M"]), BS * nH, 1)
 
-    _attn_fwd[grid](q, k, v, o, sm_scale, LEN_Q, LEN_KV, HEAD_DIM)
+    triton_attn_kernel[grid](q, k, v, o, None, None, sm_scale, LEN_Q, LEN_KV, HEAD_DIM)
+
+    return o
+
+
+# TODO: update configs
+triton_scaled_qk_attn_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
+        for BM in [64, 128]
+        for BN in [64, 128]
+        for s in [2, 3, 4]
+        for w in [4, 8]
+    ],
+    key=["LEN_Q", "LEN_KV", "HEAD_DIM"],
+)(attn_kernel)
+
+
+def triton_scaled_qk_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor, scale_k: Tensor):
+    BS, nH, LEN_Q, HEAD_DIM = q.shape
+    LEN_KV = k.shape[2]
+    assert k.shape == (BS, nH, LEN_KV, HEAD_DIM)
+    assert v.shape == (BS, nH, LEN_KV, HEAD_DIM)
+    assert scale_q.shape == (BS, nH, LEN_Q)
+    assert scale_k.shape == (BS, nH, LEN_KV)
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert scale_q.is_contiguous()
+    assert scale_k.is_contiguous()
+
+    sm_scale = HEAD_DIM**-0.5
+    o = torch.empty_like(q, dtype=v.dtype)
+
+    def grid(args):
+        return (triton.cdiv(LEN_Q, args["BLOCK_M"]), BS * nH, 1)
+
+    triton_scaled_qk_attn_kernel[grid](q, k, v, o, scale_q, scale_k, sm_scale, LEN_Q, LEN_KV, HEAD_DIM)
 
     return o
