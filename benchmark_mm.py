@@ -71,12 +71,9 @@ if __name__ == "__main__":
     torch._inductor.config.force_fuse_int_mm_with_mul = True
 
     data = []
-    shapes = [
-        (1024, 1024, 1024),
-        (2048, 2048, 2048),
-        (4096, 4096, 4096),
-    ]
-    for M, N, K in shapes:
+    shapes = [1024, 2048, 4096]
+    for shape in shapes:
+        M = N = K = shape
         print(f"{M=}, {N=}, {K=}")
 
         A_bf16 = torch.randn(M, K).bfloat16()
