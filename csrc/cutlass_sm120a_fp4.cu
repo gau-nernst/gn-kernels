@@ -39,7 +39,7 @@ using Multiply = Sm90Compute<cutlass::multiplies, ElementAcc, ElementAcc, RoundS
 using Add      = Sm90Compute<cutlass::plus, ElementAcc, ElementAcc, RoundStyle>;
 using Cast     = Sm90Compute<cutlass::epilogue::thread::Identity, ElementOutput, ElementAcc, RoundStyle>;
 
-at::Tensor mxfp4_mm(
+at::Tensor cutlass_sm120a_mxfp4_mm(
   const at::Tensor& A,
   const at::Tensor& B,
   const at::Tensor& scales_A,
@@ -135,7 +135,7 @@ at::Tensor mxfp4_mm(
   return D;
 }
 
-at::Tensor nvfp4_mm(
+at::Tensor cutlass_sm120a_nvfp4_mm(
   const at::Tensor &A,
   const at::Tensor &B,
   const at::Tensor &scales_A,
@@ -244,6 +244,6 @@ at::Tensor nvfp4_mm(
 
 TORCH_LIBRARY_IMPL(gn_kernels, CUDA, m)
 {
-  m.impl("gn_kernels::mxfp4_mm", &mxfp4_mm);
-  m.impl("gn_kernels::nvfp4_mm", &nvfp4_mm);
+  m.impl("gn_kernels::cutlass_sm120a_mxfp4_mm", &cutlass_sm120a_mxfp4_mm);
+  m.impl("gn_kernels::cutlass_sm120a_nvfp4_mm", &cutlass_sm120a_nvfp4_mm);
 }

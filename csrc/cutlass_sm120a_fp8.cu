@@ -32,7 +32,7 @@ using OperatorClass = cutlass::arch::OpClassTensorOp;
 
 using ClusterShape = Shape<_1, _1, _1>;
 
-at::Tensor cutlass_fp8_mm(at::Tensor A, at::Tensor B)
+at::Tensor cutlass_sm120a_fp8_mm(at::Tensor A, at::Tensor B)
 {
   int M = A.size(0);
   int K = A.size(1);
@@ -104,7 +104,7 @@ at::Tensor cutlass_fp8_mm(at::Tensor A, at::Tensor B)
 }
 
 template <typename TileShape>
-void cutlass_scaled_fp8_mm_dispatch(
+void cutlass_sm120a_row_scaled_fp8_mm_dispatch(
   const ElementInput* A_ptr,
   const ElementInput* B_ptr,
   const ElementScale* scale_A_ptr,
@@ -192,7 +192,7 @@ void cutlass_scaled_fp8_mm_dispatch(
   CUTLASS_CHECK(gemm.run(stream));
 }
 
-at::Tensor cutlass_scaled_fp8_mm(at::Tensor A, at::Tensor B, at::Tensor scale_A, at::Tensor scale_B)
+at::Tensor cutlass_sm120a_row_scaled_fp8_mm(at::Tensor A, at::Tensor B, at::Tensor scale_A, at::Tensor scale_B)
 {
   int M = A.size(0);
   int K = A.size(1);
@@ -207,10 +207,10 @@ at::Tensor cutlass_scaled_fp8_mm(at::Tensor A, at::Tensor B, at::Tensor scale_A,
 
   // NOTE: currently this is not good for small M
   if (M < 256)
-    cutlass_scaled_fp8_mm_dispatch<Shape<_64, _64, _128>>(
+    cutlass_sm120a_row_scaled_fp8_mm_dispatch<Shape<_64, _64, _128>>(
         A_ptr, B_ptr, scale_A_ptr, scale_B_ptr, out_ptr, M, N, K);
   else
-    cutlass_scaled_fp8_mm_dispatch<Shape<_128, _128, _128>>(
+    cutlass_sm120a_row_scaled_fp8_mm_dispatch<Shape<_128, _128, _128>>(
         A_ptr, B_ptr, scale_A_ptr, scale_B_ptr, out_ptr, M, N, K);
 
   return out;
@@ -218,6 +218,6 @@ at::Tensor cutlass_scaled_fp8_mm(at::Tensor A, at::Tensor B, at::Tensor scale_A,
 
 TORCH_LIBRARY_IMPL(gn_kernels, CUDA, m)
 {
-  m.impl("gn_kernels::cutlass_fp8_mm", &cutlass_fp8_mm);
-  m.impl("gn_kernels::cutlass_scaled_fp8_mm", &cutlass_scaled_fp8_mm);
+  m.impl("gn_kernels::cutlass_sm120a_fp8_mm", &cutlass_sm120a_fp8_mm);
+  m.impl("gn_kernels::cutlass_sm120a_row_scaled_fp8_mm", &cutlass_sm120a_row_scaled_fp8_mm);
 }

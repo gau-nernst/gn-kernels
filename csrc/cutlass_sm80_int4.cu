@@ -29,7 +29,7 @@ constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
 
 // we will do input checks in python. A and B are stored as int8
-at::Tensor int4_mm(at::Tensor A, at::Tensor B) {
+at::Tensor cutlass_sm80_int4_mm(at::Tensor A, at::Tensor B) {
   int M = A.size(0);
   int K = A.size(1) * 2;
   int N = B.size(1);
@@ -68,12 +68,13 @@ at::Tensor int4_mm(at::Tensor A, at::Tensor B) {
 // this function is based on the following cutlass example
 // https://github.com/NVIDIA/cutlass/blob/main/examples/47_ampere_gemm_universal_streamk/ampere_gemm_universal_streamk_broadcast.cu
 // also with the help of emitted code from cutlass Python
-at::Tensor scaled_int4_mm(at::Tensor A, at::Tensor B, at::Tensor row_scale, at::Tensor col_scale) {
+at::Tensor cutlass_sm80_row_scaled_int4_mm(at::Tensor A, at::Tensor B, at::Tensor scale_A, at::Tensor scale_B) {
   int M = A.size(0);
   int K = A.size(1) * 2;
   int N = B.size(1);
-  at::Tensor C = at::empty({M, N}, row_scale.options());
+  at::Tensor C = at::empty({M, N}, A.options().dtype(at::kBFloat16));
 
+  using ElementScale    = float;
   using ElementC        = cutlass::bfloat16_t;
   using ElementEpilogue = float;
 
@@ -84,40 +85,27 @@ at::Tensor scaled_int4_mm(at::Tensor A, at::Tensor B, at::Tensor row_scale, at::
   using ThreadblockShape = cutlass::gemm::GemmShape<128, 256, 128>;
   using WarpShape        = cutlass::gemm::GemmShape<64, 64, 128>;
   using InstructionShape = cutlass::gemm::GemmShape<16, 8, 64>;
-
   constexpr int numStages = 3;
-  constexpr int numEpilogueStages = 1;
 
   // build epilogue visitor tree
-  using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
-    ThreadblockShape, WarpShape, ElementC, AlignmentC, numEpilogueStages
-  >;
-
-  using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
   constexpr auto RoundMode = cutlass::FloatRoundStyle::round_to_nearest;
-  using Multiply = cutlass::epilogue::threadblock::VisitorCompute<
-    cutlass::multiplies, ElementEpilogue, ElementEpilogue, RoundMode
-  >;
+  constexpr int numEpilogueStages = 1;
 
-  // (1, N)
-  using ColScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<
-    OutputTileThreadMap, ElementC,
-    cute::Stride<cute::_0, cute::_1, int32_t>  // MNL
-  >;
-  using EVTCompute0 = cutlass::epilogue::threadblock::Sm80EVT<Multiply, Accum, ColScale>;
+  using namespace cute;
+  using namespace cutlass::epilogue::threadblock;
+  using Multiply = VisitorCompute<cutlass::multiplies, ElementEpilogue, ElementEpilogue, RoundMode>;
+  using OutputTileThreadMap = OutputTileThreadLayout<ThreadblockShape, WarpShape, ElementC, AlignmentC, numEpilogueStages>;
+
+  // (1, N). stride is MNL (whatever that is)
+  using ColScale = VisitorRowBroadcast<OutputTileThreadMap, ElementScale, Stride<_0, _1, int32_t>>;
+  using EVTCompute0 = Sm80EVT<Multiply, VisitorAccFetch, ColScale>;
 
   // (M, 1)
-  using RowScale = cutlass::epilogue::threadblock::VisitorColBroadcast<
-    OutputTileThreadMap, ElementC,
-    cute::Stride<cute::_1, cute::_0, int32_t>  // MNL
-  >;
-  using EVTCompute1 = cutlass::epilogue::threadblock::Sm80EVT<Multiply, EVTCompute0, RowScale>;
+  using RowScale = VisitorColBroadcast<OutputTileThreadMap, ElementScale, Stride<_1, _0, int32_t>>;
+  using EVTCompute1 = Sm80EVT<Multiply, EVTCompute0, RowScale>;
 
-  using Output = cutlass::epilogue::threadblock::VisitorAuxStore<
-    OutputTileThreadMap, ElementC, RoundMode,
-    cute::Stride<int64_t, cute::_1, int64_t>  // MNL
-  >;
-  using EVTOutput = cutlass::epilogue::threadblock::Sm80EVT<Output, EVTCompute1>;
+  using Output = VisitorAuxStore<OutputTileThreadMap, ElementC, RoundMode, Stride<int64_t, _1, int64_t>>;
+  using EVTOutput = Sm80EVT<Output, EVTCompute1>;
 
   // to make this work with GemmIdentityThreadblockSwizzle, requires the patch from
   // https://github.com/NVIDIA/cutlass/pull/1753
@@ -135,23 +123,23 @@ at::Tensor scaled_int4_mm(at::Tensor A, at::Tensor B, at::Tensor row_scale, at::
   >::GemmKernel;
   using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<EVTKernel>;
 
-  const ElementA *A_ptr         = reinterpret_cast<ElementA *>(A.data_ptr());
-  const ElementB *B_ptr         = reinterpret_cast<ElementB *>(B.data_ptr());
-  const ElementC *col_scale_ptr = reinterpret_cast<ElementC *>(col_scale.data_ptr());
-  const ElementC *row_scale_ptr = reinterpret_cast<ElementC *>(row_scale.data_ptr());
-  ElementC *C_ptr               = reinterpret_cast<ElementC *>(C.data_ptr());
+  const ElementA *A_ptr           = reinterpret_cast<ElementA *>(A.data_ptr());
+  const ElementB *B_ptr           = reinterpret_cast<ElementB *>(B.data_ptr());
+  const ElementScale *scale_A_ptr = reinterpret_cast<ElementScale *>(scale_A.data_ptr());
+  const ElementScale *scale_B_ptr = reinterpret_cast<ElementScale *>(scale_B.data_ptr());
+  ElementC *C_ptr                 = reinterpret_cast<ElementC *>(C.data_ptr());
 
   typename EVTOutput::Arguments callback_args{
     {
       {
-        {},                                                                  // Accum
-        {col_scale_ptr, ElementC(0), {cute::_0{}, cute::_1{}, int32_t(N)}},  // ColScale
-        {}                                                                   // Multiply
-      },                                                                     // EVTCompute0
-      {row_scale_ptr, ElementC(0), {cute::_1{}, cute::_0{}, int32_t(M)}},    // RowScale
-      {}                                                                     // Multiply
-    },                                                                       // EVTCompute1
-    {C_ptr, {int64_t{N}, cute::_1{}, int64_t{M*N}}}                          // EVTOutput
+        {},                                                    // Accum
+        {scale_B_ptr, ElementC(0), {_0{}, _1{}, int32_t(N)}},  // ColScale
+        {}                                                     // Multiply
+      },                                                       // EVTCompute0
+      {scale_A_ptr, ElementC(0), {_1{}, _0{}, int32_t(M)}},    // RowScale
+      {}                                                       // Multiply
+    },                                                         // EVTCompute1
+    {C_ptr, {int64_t{N}, _1{}, int64_t{M*N}}}                  // EVTOutput
   };
 
   typename DeviceGemm::Arguments args(
@@ -165,14 +153,15 @@ at::Tensor scaled_int4_mm(at::Tensor A, at::Tensor B, at::Tensor row_scale, at::
   );
 
   DeviceGemm gemm_op;
-  auto stream = at::cuda::getCurrentCUDAStream();
   CUTLASS_CHECK(gemm_op.can_implement(args));
+
+  auto stream = at::cuda::getCurrentCUDAStream();
   CUTLASS_CHECK(gemm_op(args, nullptr, stream));
 
   return C;
 }
 
 TORCH_LIBRARY_IMPL(gn_kernels, CUDA, m) {
-  m.impl("gn_kernels::int4_mm", &int4_mm);
-  m.impl("gn_kernels::scaled_int4_mm", &scaled_int4_mm);
+  m.impl("gn_kernels::cutlass_sm80_int4_mm", &cutlass_sm80_int4_mm);
+  m.impl("gn_kernels::cutlass_sm80_row_scaled_int4_mm", &cutlass_sm80_row_scaled_int4_mm);
 }
