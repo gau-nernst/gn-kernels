@@ -14,8 +14,8 @@ def get_extension(arch: str):
         gencode = f"arch=compute_{arch},code=compute_{arch}"  # compile to PTX
 
     return CUDAExtension(
-        name=f"{NAME}.cutlass_sm{arch}",
-        sources=[str(x) for x in CURRENT_DIR.glob(f"csrc/cutlass_sm{arch}_*.cu")],
+        name=f"{NAME}.sm{arch}",
+        sources=[str(x) for x in CURRENT_DIR.glob(f"csrc/sm{arch}/*.cu")],
         py_limited_api=True,
         extra_compile_args=dict(
             nvcc=[
