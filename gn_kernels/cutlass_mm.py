@@ -1,16 +1,8 @@
-from pathlib import Path
-
 import torch
 from torch import Tensor
 
 from ._lib import lib, lib_ops
 from .utils import FP4_DTYPE
-
-CURRENT_DIR = Path(__file__).parent
-
-
-for shared_lib in CURRENT_DIR.glob("*.so"):
-    torch.ops.load_library(shared_lib)
 
 # sm80
 lib.define("cutlass_sm80_int4_mm(Tensor A, Tensor B) -> Tensor")

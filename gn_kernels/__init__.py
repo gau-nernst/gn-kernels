@@ -1,3 +1,8 @@
+from pathlib import Path
+
+import torch
+
+from .attn import attn_mxfp8
 from .cutlass_mm import (
     cutlass_fp8_mm,
     cutlass_int4_mm,
@@ -21,6 +26,7 @@ __all__ = [
     "triton_scaled_mm",
     "triton_attn",
     "triton_scaled_qk_attn",
+    "attn_mxfp8",
     "quantize_mx",
     "quantize_nvfp4",
     "quantize_nvfp4_triton",
@@ -28,3 +34,8 @@ __all__ = [
     "pack_block_scales_nv",
     "FP4_DTYPE",
 ]
+
+CURRENT_DIR = Path(__file__).parent
+
+for shared_lib in CURRENT_DIR.glob("*.so"):
+    torch.ops.load_library(shared_lib)
