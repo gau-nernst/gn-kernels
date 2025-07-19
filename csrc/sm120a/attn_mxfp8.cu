@@ -337,15 +337,18 @@ at::Tensor sm120a_attn_mxfp8(
   int dim = Q.size(3);
 
   TORCH_CHECK(dim == 128, "Only supports dim=128");
-  TORCH_CHECK(Q.is_contiguous());
-  TORCH_CHECK(K.is_contiguous());
-  TORCH_CHECK(V.is_contiguous());
+  // possibly make a copy inside the kernel. this is undesirable.
+  // workaround until figure out how to force torch.compile() to use
+  // contiguous layout for a particular custom op.
+  auto Q_copy = Q.contiguous();
+  auto K_copy = K.contiguous();
+  auto V_copy = V.contiguous();
 
   at::Tensor O = at::empty_like(Q, Q.options().dtype(at::kBFloat16));
 
-  auto Q_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(Q.data_ptr());
-  auto K_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(K.data_ptr());
-  auto V_ptr = reinterpret_cast<const nv_bfloat16 *>(V.data_ptr());
+  auto Q_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(Q_copy.data_ptr());
+  auto K_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(K_copy.data_ptr());
+  auto V_ptr = reinterpret_cast<const nv_bfloat16 *>(V_copy.data_ptr());
   auto scale_Q_ptr = reinterpret_cast<const __nv_fp8_e8m0 *>(scale_Q.data_ptr());
   auto scale_K_ptr = reinterpret_cast<const __nv_fp8_e8m0 *>(scale_K.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
