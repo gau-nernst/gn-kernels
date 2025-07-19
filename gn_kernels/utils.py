@@ -109,39 +109,42 @@ def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"
     return xq, scales
 
 
-def dequantize_mxfp4(xq: Tensor, scales: Tensor):
-    assert xq.dtype == FP4_DTYPE
+def dequantize_mx(xq: Tensor, scales: Tensor):
     assert scales.dtype == torch.float8_e8m0fnu
 
-    FP4E2M1_LUT = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        device=xq.device,
-        dtype=torch.float32,
-    )
+    if xq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return (xq.float().reshape(-1, 32) * scales.float().reshape(-1, 1)).view(xq.shape)
 
-    M = xq.shape[0]
-    N = xq.shape[1] * 2
+    elif xq.dtype == FP4_DTYPE:
+        FP4E2M1_LUT = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            device=xq.device,
+            dtype=torch.float32,
+        )
 
-    # unpack
-    xq_i32 = xq.view(torch.int32)
-    xq_unpacked = torch.stack(
-        [
-            xq_i32 & 0xF,
-            (xq_i32 >> 4) & 0xF,
-            (xq_i32 >> 8) & 0xF,
-            (xq_i32 >> 12) & 0xF,
-            (xq_i32 >> 16) & 0xF,
-            (xq_i32 >> 20) & 0xF,
-            (xq_i32 >> 24) & 0xF,
-            (xq_i32 >> 28) & 0xF,
-        ],
-        dim=-1,
-    )
-    x = FP4E2M1_LUT[xq_unpacked]
+        M = xq.shape[0]
+        N = xq.shape[1] * 2
 
-    scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-    x_scaled = x.view(M, N // 32, 32) * scales_f32.reshape(M, N // 32, 1)
-    return x_scaled.view(M, N)
+        # unpack
+        xq_i32 = xq.view(torch.int32)
+        xq_unpacked = torch.stack(
+            [
+                xq_i32 & 0xF,
+                (xq_i32 >> 4) & 0xF,
+                (xq_i32 >> 8) & 0xF,
+                (xq_i32 >> 12) & 0xF,
+                (xq_i32 >> 16) & 0xF,
+                (xq_i32 >> 20) & 0xF,
+                (xq_i32 >> 24) & 0xF,
+                (xq_i32 >> 28) & 0xF,
+            ],
+            dim=-1,
+        )
+        x = FP4E2M1_LUT[xq_unpacked]
+
+        scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+        x_scaled = x.view(M, N // 32, 32) * scales_f32.reshape(M, N // 32, 1)
+        return x_scaled.view(M, N)
 
 
 # https://docs.nvidia.com/cuda/cublas/index.html#d-block-quantization

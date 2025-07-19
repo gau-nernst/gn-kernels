@@ -7,7 +7,13 @@ lib.define("sm120a_attn_mxfp8(Tensor Q, Tensor K, Tensor V, Tensor scale_Q, Tens
 
 
 def attn_mxfp8(Q: Tensor, K: Tensor, V: Tensor, scale_Q: Tensor, scale_K: Tensor):
-    return lib_ops.sm120a_attn_mxfp8(Q, K, V, scale_Q, scale_K)
+    return lib_ops.sm120a_attn_mxfp8(
+        Q.contiguous(),
+        K.contiguous(),
+        V.contiguous(),
+        scale_Q.contiguous(),
+        scale_K.contiguous(),
+    )
 
 
 @torch.library.impl(lib, "sm120a_attn_mxfp8", "Meta")

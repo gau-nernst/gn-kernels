@@ -13,7 +13,7 @@ from .cutlass_mm import (
 )
 from .triton_attn import triton_attn, triton_scaled_qk_attn
 from .triton_mm import triton_mm, triton_scaled_mm
-from .utils import FP4_DTYPE, dequantize_mxfp4, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
+from .utils import FP4_DTYPE, dequantize_mx, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
 
 __all__ = [
     "cutlass_int4_mm",
@@ -30,7 +30,7 @@ __all__ = [
     "quantize_mx",
     "quantize_nvfp4",
     "quantize_nvfp4_triton",
-    "dequantize_mxfp4",
+    "dequantize_mx",
     "pack_block_scales_nv",
     "FP4_DTYPE",
 ]

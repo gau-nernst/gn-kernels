@@ -113,7 +113,7 @@ void ldmatrix_trans(uint32_t *regs, uint32_t addr) {
 }
 
 __device__ inline
-void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
+void mma_m16n8k16_bf16(uint32_t A[4], uint32_t B[2], float D[4]) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "
@@ -123,6 +123,32 @@ void mma_m16n8k16(uint32_t A[4], uint32_t B[2], float D[4]) {
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]),
                 "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
+}
+
+__device__ inline
+void mma_m16n8k32_s8s8(uint32_t A[4], uint32_t B[2], int32_t D[4]) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 "
+              "{%0, %1, %2, %3}, "
+              "{%4, %5, %6, %7}, "
+              "{%8, %9}, "
+              "{%10, %11, %12, %13};"
+              : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                "r"(B[0]), "r"(B[1]),
+                "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]));
+}
+
+__device__ inline
+void mma_m16n8k32_u8s8(uint32_t A[4], uint32_t B[2], int32_t D[4]) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
+              "{%0, %1, %2, %3}, "
+              "{%4, %5, %6, %7}, "
+              "{%8, %9}, "
+              "{%10, %11, %12, %13};"
+              : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                "r"(B[0]), "r"(B[1]),
+                "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]));
 }
 
 __device__ inline
