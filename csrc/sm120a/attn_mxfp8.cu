@@ -80,7 +80,7 @@ void sm120a_attn_mxfp8_kernel(
   // set up registers
   uint32_t Q_rmem[WARP_Q / MMA_M][DIM / MMA_K_FP8][4];
   uint32_t K_rmem[BLOCK_KV / MMA_N][DIM / MMA_K_FP8][2];
-  uint32_t scale_Q_rmem[WARP_Q / 32];
+  uint32_t scale_Q_rmem[cdiv(WARP_Q, 32)];
   uint32_t scale_K_rmem[BLOCK_KV / 32];
 
   // let compiler decide register reuse?
@@ -112,9 +112,8 @@ void sm120a_attn_mxfp8_kernel(
     V_smem_thread = swizzle<DIM * sizeof(TypeV)>(V_smem + (row * DIM + col) * sizeof(TypeV));
   }
 
-  // NOTE (again): for MXFP8 scales, we repack [32,4] = [4,8,4] -> [8,4,4]
-  uint32_t scale_Q_smem_thread = scale_Q_smem + (warp_id * WARP_Q / 4 + lane_id) * 16;
-  uint32_t scale_K_smem_thread = scale_K_smem + lane_id * 16;
+  // NOTE (again): for MXFP8 scales, we repack [32,4] = [4,8,4] -> [8,4,4] (128 elements)
+  const uint32_t scale_K_smem_thread = scale_K_smem + lane_id * 16;
 
   const float softmax_scale = rsqrtf(static_cast<float>(DIM));
 
@@ -141,7 +140,20 @@ void sm120a_attn_mxfp8_kernel(
       addr ^= mma_id_d * MMA_K_FP8 * sizeof(TypeQ);  // col
       ldmatrix<4>(Q_rmem[mma_id_q][mma_id_d], addr);
     }
-  ldmatrix<WARP_Q / 32>(scale_Q_rmem, scale_Q_smem_thread);
+
+  // we don't use ldmatrix for scale_Q here since WARP_Q can be 16.
+  // we only load scale_Q once, so being slow is not a big problem.
+  // NOTE: our [4,8,4] block has stride [4,16,1]
+  // don't need to select the last dim, since we load 4 elems together
+  for (int reg_id = 0; reg_id < cdiv(WARP_Q, 32); reg_id++) {
+    const uint32_t row = warp_id * WARP_Q;
+    const uint32_t addr = scale_Q_smem
+                        + (row / 32) * 128                       // select the [4,8,4] block
+                        + ((row % 32) / 8 + (lane_id % 4)) * 4   // select 1st dim of [4,8,4] block - stride=4
+                        + (lane_id / 4) * 16;                    // select 2nd dim of [4,8,4] block - stride=16
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(scale_Q_rmem[reg_id]) : "r"(addr));
+  }
+
   // we need a syncthreads() here so that we don't load K global->shared
   // before finishing loading Q shared->reg
   __syncthreads();
@@ -353,7 +365,7 @@ at::Tensor sm120a_attn_mxfp8(
   auto scale_K_ptr = reinterpret_cast<const __nv_fp8_e8m0 *>(scale_K.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
 
-  const int BLOCK_Q = 128;
+  const int BLOCK_Q = 64;
   const int BLOCK_KV = 64;
   const int DIM = 128;
   const int NUM_WARPS = 4;

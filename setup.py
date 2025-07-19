@@ -23,6 +23,7 @@ def get_extension(arch: str):
                 f"-I{CURRENT_DIR / 'cutlass/tools/util/include'}",
                 f"-gencode={gencode}",
                 # "-DCUTLASS_DEBUG_TRACE_LEVEL=1",
+                # "-Xptxas=-v",
             ]
         ),
         define_macros=[("Py_LIMITED_API", "0x03090000")],
