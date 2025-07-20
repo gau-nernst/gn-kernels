@@ -11,25 +11,23 @@
 #include <ATen/cuda/CUDAUtils.h>
 #include <ATen/cuda/CUDAContext.h>
 
+using TypeQK    = __nv_fp8_e4m3;
+using TypeV     = nv_bfloat16;
+using TypeScale = __nv_fp8_e8m0;
+
 template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void sm120a_attn_mxfp8_qk_kernel(
-  const __nv_fp8_e4m3 *Q,        // [bs, len_q, DIM]
-  const __nv_fp8_e4m3 *K,        // [bs, len_kv, DIM]
-  const nv_bfloat16 *V,          // [bs, len_kv, DIM]
-  const __nv_fp8_e8m0 *scale_Q,  // [bs, len_q, DIM/32]
-  const __nv_fp8_e8m0 *scale_K,  // [bs, len_kv, DIM/32]
-  nv_bfloat16 *O,                // [bs, len_q, DIM]
+  const TypeQK *Q,           // [bs, len_q, DIM]
+  const TypeQK *K,           // [bs, len_kv, DIM]
+  const TypeV *V,            // [bs, len_kv, DIM]
+  const TypeScale *scale_Q,  // [bs, len_q, DIM/32]
+  const TypeScale *scale_K,  // [bs, len_kv, DIM/32]
+  nv_bfloat16 *O,            // [bs, len_q, DIM]
   int bs,
   int len_q,
   int len_kv) {
-
-  using TypeQ = __nv_fp8_e4m3;
-  using TypeK = __nv_fp8_e4m3;
-  using TypeV = nv_bfloat16;
-  using TypeScaleQ = __nv_fp8_e8m0;
-  using TypeScaleK = __nv_fp8_e8m0;
 
   // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-block-scaling
   // for MXFP8 scales, we repack [32,4] = [4,8,4] -> [8,4,4]
@@ -59,13 +57,13 @@ void sm120a_attn_mxfp8_qk_kernel(
   // since we only need to load (Q_smem + scale_Q_smem) once
   extern __shared__ uint8_t smem[];
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-  const uint32_t scale_Q_smem = Q_smem + BLOCK_Q * DIM * sizeof(TypeQ);
+  const uint32_t scale_Q_smem = Q_smem + BLOCK_Q * DIM * sizeof(TypeQK);
 
   // double buffer for K and scale_K
   const uint32_t K_smem = Q_smem;
-  const uint32_t scale_K_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeK);
+  const uint32_t scale_K_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeQK);
 
-  const uint32_t V_smem = scale_K_smem + 2 * BLOCK_KV * (DIM / 32) * sizeof(TypeScaleK);
+  const uint32_t V_smem = scale_K_smem + 2 * BLOCK_KV * (DIM / 32) * sizeof(TypeScale);
 
   // FA2: shard BLOCK_Q among all warps
   // replicate K and V on all warps
@@ -96,14 +94,14 @@ void sm120a_attn_mxfp8_qk_kernel(
   {
     // A tile
     const int row = warp_id * WARP_Q + (lane_id % 16);
-    const int col = (lane_id / 16) * (16 / sizeof(TypeQ));
-    Q_smem_thread = swizzle<DIM * sizeof(TypeQ)>(Q_smem + (row * DIM + col) * sizeof(TypeQ));
+    const int col = (lane_id / 16) * (16 / sizeof(TypeQK));
+    Q_smem_thread = swizzle<DIM * sizeof(TypeQK)>(Q_smem + (row * DIM + col) * sizeof(TypeQK));
   }
   {
     // B tile
     const int row = lane_id % 8;
-    const int col = (lane_id / 8) * (16 / sizeof(TypeK));
-    K_smem_thread = swizzle<DIM * sizeof(TypeK)>(K_smem + (row * DIM + col) * sizeof(TypeK));
+    const int col = (lane_id / 8) * (16 / sizeof(TypeQK));
+    K_smem_thread = swizzle<DIM * sizeof(TypeQK)>(K_smem + (row * DIM + col) * sizeof(TypeQK));
   }
   {
     // B tile trans
@@ -137,8 +135,8 @@ void sm120a_attn_mxfp8_qk_kernel(
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_FP8; mma_id_d++) {
       uint32_t addr = Q_smem_thread;
-      addr += mma_id_q * MMA_M * DIM * sizeof(TypeQ);  // row
-      addr ^= mma_id_d * MMA_K_FP8 * sizeof(TypeQ);  // col
+      addr += mma_id_q * MMA_M * DIM * sizeof(TypeQK);  // row
+      addr ^= mma_id_d * MMA_K_FP8 * sizeof(TypeQK);  // col
       ldmatrix<4>(Q_rmem[mma_id_q][mma_id_d], addr);
     }
 
@@ -164,8 +162,8 @@ void sm120a_attn_mxfp8_qk_kernel(
   auto load_K = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
       // double buffer for K
-      const uint32_t K_dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(TypeK));
-      const uint32_t scale_K_dst = scale_K_smem + (kv_id % 2) * (BLOCK_KV * (DIM / 32) * sizeof(TypeScaleK));
+      const uint32_t K_dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(TypeQK));
+      const uint32_t scale_K_dst = scale_K_smem + (kv_id % 2) * (BLOCK_KV * (DIM / 32) * sizeof(TypeScale));
       global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_dst, K, DIM, tid);
       global_to_shared_swizzle<BLOCK_KV / 4, DIM / 8, TB_SIZE>(scale_K_dst, scale_K, DIM / 8, tid);
       K += BLOCK_KV * DIM;
@@ -197,13 +195,13 @@ void sm120a_attn_mxfp8_qk_kernel(
     __syncthreads();
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_FP8; mma_id_d += 2) {
-        uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(TypeK));
-        addr += mma_id_kv * MMA_N * DIM * sizeof(TypeK);  // row
-        addr ^= mma_id_d * MMA_K_FP8 * sizeof(TypeK);  // col
+        uint32_t addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(TypeQK));
+        addr += mma_id_kv * MMA_N * DIM * sizeof(TypeQK);  // row
+        addr ^= mma_id_d * MMA_K_FP8 * sizeof(TypeQK);  // col
         ldmatrix<4>(K_rmem[mma_id_kv][mma_id_d], addr);
       }
     {
-      const uint32_t addr = scale_K_smem_thread + (kv_id % 2) * (BLOCK_KV * (DIM / 32) * sizeof(TypeScaleK));
+      const uint32_t addr = scale_K_smem_thread + (kv_id % 2) * (BLOCK_KV * (DIM / 32) * sizeof(TypeScale));
       ldmatrix<BLOCK_KV / 32>(scale_K_rmem, addr);
     }
 
@@ -359,11 +357,11 @@ at::Tensor sm120a_attn_mxfp8_qk(
 
   at::Tensor O = at::empty_like(Q, Q.options().dtype(at::kBFloat16));
 
-  auto Q_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(Q_copy.data_ptr());
-  auto K_ptr = reinterpret_cast<const __nv_fp8_e4m3 *>(K_copy.data_ptr());
-  auto V_ptr = reinterpret_cast<const nv_bfloat16 *>(V_copy.data_ptr());
-  auto scale_Q_ptr = reinterpret_cast<const __nv_fp8_e8m0 *>(scale_Q.data_ptr());
-  auto scale_K_ptr = reinterpret_cast<const __nv_fp8_e8m0 *>(scale_K.data_ptr());
+  auto Q_ptr = reinterpret_cast<const TypeQK *>(Q_copy.data_ptr());
+  auto K_ptr = reinterpret_cast<const TypeQK *>(K_copy.data_ptr());
+  auto V_ptr = reinterpret_cast<const TypeV *>(V_copy.data_ptr());
+  auto scale_Q_ptr = reinterpret_cast<const TypeScale *>(scale_Q.data_ptr());
+  auto scale_K_ptr = reinterpret_cast<const TypeScale *>(scale_K.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
 
   const int BLOCK_Q = 64;
@@ -375,7 +373,7 @@ at::Tensor sm120a_attn_mxfp8_qk(
   const int TB_SIZE = NUM_WARPS * WARP_SIZE;
   const int Q_smem_size = BLOCK_Q * (DIM + DIM / 32);
   const int K_smem_size = 2 * BLOCK_KV * (DIM + DIM / 32);
-  const int V_smem_size = BLOCK_KV * DIM * sizeof(nv_bfloat16);
+  const int V_smem_size = BLOCK_KV * DIM * sizeof(TypeV);
   const int smem_size = max(Q_smem_size, K_smem_size + V_smem_size);
 
   auto kernel = sm120a_attn_mxfp8_qk_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
