@@ -115,7 +115,8 @@ void sm120a_attn_mxfp8_qk_kernel(
   // NOTE (again): for MXFP8 scales, we repack [32,4] = [4,8,4] -> [8,4,4] (128 elements)
   const uint32_t scale_K_smem_thread = scale_K_smem + lane_id * 16;
 
-  const float softmax_scale = rsqrtf(static_cast<float>(DIM));
+  // exp(x) = exp(log(2) * x / log(2)) = exp2(x / log2)
+  const float softmax_scale = rsqrtf(static_cast<float>(DIM)) * 1.4426950408889634;
 
   float rowmax[WARP_Q / MMA_M][2];
   float rowsumexp[WARP_Q / MMA_M][2] = {};
@@ -250,8 +251,8 @@ void sm120a_attn_mxfp8_qk_kernel(
 
       // rescale for previous O
       float rescale[2];
-      rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
-      rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+      rescale[0] = exp2f(rowmax[mma_id_q][0] - this_rowmax[0]);
+      rescale[1] = exp2f(rowmax[mma_id_q][1] - this_rowmax[1]);
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
         O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
         O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
@@ -267,10 +268,10 @@ void sm120a_attn_mxfp8_qk_kernel(
       float this_rowsumexp[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
         float *regs = QK_rmem[mma_id_q][mma_id_kv];
-        regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);  // c0
-        regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);  // c1
-        regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);  // c2
-        regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);  // c3
+        regs[0] = exp2f(regs[0] - rowmax[mma_id_q][0]);  // c0
+        regs[1] = exp2f(regs[1] - rowmax[mma_id_q][0]);  // c1
+        regs[2] = exp2f(regs[2] - rowmax[mma_id_q][1]);  // c2
+        regs[3] = exp2f(regs[3] - rowmax[mma_id_q][1]);  // c3
 
         if (mma_id_kv == 0) {
           this_rowsumexp[0] = regs[0] + regs[1];
