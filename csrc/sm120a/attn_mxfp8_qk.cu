@@ -14,7 +14,7 @@
 template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
-void sm120a_attn_mxfp8_kernel(
+void sm120a_attn_mxfp8_qk_kernel(
   const __nv_fp8_e4m3 *Q,        // [bs, len_q, DIM]
   const __nv_fp8_e4m3 *K,        // [bs, len_kv, DIM]
   const nv_bfloat16 *V,          // [bs, len_kv, DIM]
@@ -336,7 +336,7 @@ void sm120a_attn_mxfp8_kernel(
     }
 }
 
-at::Tensor sm120a_attn_mxfp8(
+at::Tensor sm120a_attn_mxfp8_qk(
   const at::Tensor& Q,        // [bs, num_heads, len_q, dim]
   const at::Tensor& K,        // [bs, num_heads, len_kv, dim]
   const at::Tensor& V,        // [bs, num_heads, len_kv, dim]
@@ -377,7 +377,7 @@ at::Tensor sm120a_attn_mxfp8(
   const int V_smem_size = BLOCK_KV * DIM * sizeof(nv_bfloat16);
   const int smem_size = max(Q_smem_size, K_smem_size + V_smem_size);
 
-  auto kernel = sm120a_attn_mxfp8_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
+  auto kernel = sm120a_attn_mxfp8_qk_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   launch_kernel(kernel, num_blocks, TB_SIZE, smem_size, stream,
                 Q_ptr, K_ptr, V_ptr, scale_Q_ptr, scale_K_ptr, O_ptr, bs, len_q, len_kv);
@@ -387,5 +387,5 @@ at::Tensor sm120a_attn_mxfp8(
 
 TORCH_LIBRARY_IMPL(gn_kernels, CUDA, m)
 {
-  m.impl("gn_kernels::sm120a_attn_mxfp8", &sm120a_attn_mxfp8);
+  m.impl("gn_kernels::sm120a_attn_mxfp8_qk", &sm120a_attn_mxfp8_qk);
 }
