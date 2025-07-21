@@ -13,11 +13,14 @@ TODO:
 
 Available kernels
 
-- SM80: Cutlass INT4 + rowwise-scaled INT4
+- SM80:
+  - Cutlass INT4 + rowwise-scaled INT4
+  - INT8 attention (QK only)
 - SM89: Cutlass FP8 + rowwise-scaled FP8
 - SM120:
   - Cutlass FP8 + rowwise-scaled FP8
   - Cutlass FP4 + rowwise-scaled FP4
+  - MXFP8 attention (QK only)
 - Triton:
   - Matmul with configurable input dtype, accumulate dtype e.g. FP16 MMA with FP16 accumulate
   - Rowwise-scaled matmul

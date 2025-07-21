@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from .attn import attn_mxfp8_qk
+from .attn import attn_int8_qk, attn_mxfp8_qk
 from .cutlass_mm import (
     cutlass_fp8_mm,
     cutlass_int4_mm,
@@ -26,6 +26,7 @@ __all__ = [
     "triton_scaled_mm",
     "triton_attn",
     "triton_scaled_qk_attn",
+    "attn_int8_qk",
     "attn_mxfp8_qk",
     "quantize_mx",
     "quantize_nvfp4",
