@@ -362,18 +362,17 @@ at::Tensor sm80_attn_int8_qk(
   TORCH_CHECK(scale_Q.dtype() == at::kFloat);
   TORCH_CHECK(scale_K.dtype() == at::kFloat);
 
-  // possibly make a copy inside the kernel. this is undesirable.
-  // workaround until figure out how to force torch.compile() to use
-  // contiguous layout for a particular custom op.
-  auto Q_copy = Q.contiguous();
-  auto K_copy = K.contiguous();
-  auto V_copy = V.contiguous();
+  TORCH_CHECK(Q.is_contiguous());
+  TORCH_CHECK(K.is_contiguous());
+  TORCH_CHECK(V.is_contiguous());
+  TORCH_CHECK(scale_Q.is_contiguous());
+  TORCH_CHECK(scale_K.is_contiguous());
 
   at::Tensor O = at::empty_like(Q, Q.options().dtype(at::kBFloat16));
 
-  auto Q_ptr = reinterpret_cast<const TypeQK *>(Q_copy.data_ptr());
-  auto K_ptr = reinterpret_cast<const TypeQK *>(K_copy.data_ptr());
-  auto V_ptr = reinterpret_cast<const TypeV *>(V_copy.data_ptr());
+  auto Q_ptr = reinterpret_cast<const TypeQK *>(Q.data_ptr());
+  auto K_ptr = reinterpret_cast<const TypeQK *>(K.data_ptr());
+  auto V_ptr = reinterpret_cast<const TypeV *>(V.data_ptr());
   auto scale_Q_ptr = reinterpret_cast<const TypeScale *>(scale_Q.data_ptr());
   auto scale_K_ptr = reinterpret_cast<const TypeScale *>(scale_K.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
