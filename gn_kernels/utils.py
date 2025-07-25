@@ -84,8 +84,8 @@ def fp32_to_fp4e2m1x2(x: Tensor):
 
 def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"):
     assert dtype in (torch.float8_e4m3fn, torch.float8_e5m2, FP4_DTYPE)
-    x_blocks_f32 = x.float().unflatten(-1, (-1, 32))  # [M, N/32, 32]
-    blocks_amax = x_blocks_f32.abs().amax(dim=-1)  # [M, N/32]
+    x_blocks_f32 = x.float().unflatten(-1, (-1, 32))  # [..., N/32, 32]
+    blocks_amax = x_blocks_f32.abs().amax(dim=-1)  # [..., N/32]
 
     if compute_scale_method == "ocp":
         block_scales_bits = absmax_to_mx_scales_ocp(blocks_amax, dtype)
@@ -104,7 +104,7 @@ def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"
         xq = fp32_to_fp4e2m1x2(x_blocks_f32)
     else:
         xq = x_blocks_f32.to(dtype)
-    xq = xq.view(x.shape[0], -1)
+    xq = xq.view(*x.shape[:-1], -1)
 
     return xq, scales
 
@@ -121,9 +121,6 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
             device=xq.device,
             dtype=torch.float32,
         )
-
-        M = xq.shape[0]
-        N = xq.shape[1] * 2
 
         # unpack
         xq_i32 = xq.view(torch.int32)
@@ -143,13 +140,13 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
         x = FP4E2M1_LUT[xq_unpacked]
 
         scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-        x_scaled = x.view(M, N // 32, 32) * scales_f32.reshape(M, N // 32, 1)
-        return x_scaled.view(M, N)
+        x_scaled = x.unflatten(-1, (xq.shape[-1] // 16, 32)) * scales_f32.unsqueeze(-1)
+        return x_scaled.view(*xq.shape[:-1], -1)
 
 
 # https://docs.nvidia.com/cuda/cublas/index.html#d-block-quantization
 def quantize_nvfp4(x: Tensor, tensor_scale: Tensor | None = None):
-    x_blocks_f32 = x.float().unflatten(-1, (-1, 16))  # [M, N/16, 16]
+    x_blocks_f32 = x.float().unflatten(-1, (-1, 16))  # [..., N/16, 16]
 
     q_dtype = FP4_DTYPE
     s_dtype = torch.float8_e4m3fn
