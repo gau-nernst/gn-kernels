@@ -15,7 +15,7 @@ Available kernels
 
 - SM80:
   - Cutlass INT4 + rowwise-scaled INT4
-  - INT8 attention (QK only)
+  - INT8 attention (QK only and QK+PV)
 - SM89: Cutlass FP8 + rowwise-scaled FP8
 - SM120:
   - Cutlass FP8 + rowwise-scaled FP8
