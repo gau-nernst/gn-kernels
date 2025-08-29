@@ -11,7 +11,7 @@ from .cutlass_mm import (
     cutlass_row_scaled_fp8_mm,
     cutlass_row_scaled_int4_mm,
 )
-from .triton_attn import triton_attn, triton_scaled_qk_attn
+from .triton_attn import triton_attn
 from .triton_mm import triton_mm, triton_scaled_mm
 from .utils import FP4_DTYPE, dequantize_mx, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
 

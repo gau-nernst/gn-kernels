@@ -10,21 +10,29 @@ from torch.nn.attention.flex_attention import flex_attention
 from triton.testing import do_bench
 
 try:
-    from flash_attn import flash_attn_func
-
-    def flash_attn(q: Tensor, k: Tensor, v: Tensor):
-        return flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+    import flash_attn
 
 except ImportError:
     flash_attn = None
 
-from gn_kernels import triton_attn, triton_scaled_qk_attn
+from gn_kernels import triton_attn
 
 
 # add a small offset so that output does not have a mean of zero,
 # which will result in large relative error
 def generate_input(*shape):
     return torch.randn(shape).add(0.5).bfloat16().cuda()
+
+
+def sdpa(q: Tensor, k: Tensor, v: Tensor):
+    q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
+    return F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
+
+
+@torch.compile(dynamic=False, mode="max-autotune-no-cudagraphs")
+def flex_attn(q: Tensor, k: Tensor, v: Tensor):
+    q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
+    return flex_attention(q, k, v).transpose(1, 2)
 
 
 def quantize(x: Tensor, dtype: torch.dtype):
@@ -35,6 +43,7 @@ def quantize(x: Tensor, dtype: torch.dtype):
     x = x.float()
     amax = x.abs().amax(dim=-1)
     scale = amax / min(-dtype_min, dtype_max)
+    # TODO: int requires .round()
     xq = (x / scale.clip(1e-6).unsqueeze(-1)).clip(dtype_min, dtype_max).to(dtype)
     return xq, scale
 
@@ -57,9 +66,9 @@ if __name__ == "__main__":
     torch.manual_seed(2025 * 2026)
     COMPUTE_CAPABILITY = torch.cuda.get_device_capability()
 
-    Q = generate_input(bs, nh, lq, head_dim)
-    K = generate_input(bs, nh, lkv, head_dim)
-    V = generate_input(bs, nh, lkv, head_dim)
+    Q = generate_input(bs, lq, nh, head_dim)
+    K = generate_input(bs, lkv, nh, head_dim)
+    V = generate_input(bs, lkv, nh, head_dim)
 
     Q_i8, scale_Q_i8 = quantize(Q, torch.int8)
     K_i8, scale_K_i8 = quantize(K, torch.int8)
@@ -74,7 +83,7 @@ if __name__ == "__main__":
 
     results = []
 
-    out_ref = F.scaled_dot_product_attention(Q, K, V)
+    out_ref = sdpa(Q, K, V)
 
     def bench(f, name, *args, check: bool = True):
         print(f"Benching {name}")
@@ -82,29 +91,35 @@ if __name__ == "__main__":
         if check:
             torch.testing.assert_close(out, out_ref)
 
-        # sleep to stabilize thermal
-        time.sleep(1)
-
+        time.sleep(1)  # stabilize thermal
         latency_ms = do_bench(lambda: f(*args), return_mode="median")
         tflops = 4 * bs * nh * lq * lkv * head_dim / latency_ms / 1e9
-        pct_sol = tflops / sol * 100
-        results.append([name, round(latency_ms, 4), round(tflops, 2), round(pct_sol, 2)])
+        pct_sol = tflops / sol
+
+        data_point = {
+            "Kernel": name,
+            "Latency (ms)": f"{latency_ms:.2f}",
+            "TFLOPS": f"{tflops:.2f}",
+            "%SOL": f"{pct_sol * 100:.2f}%",
+        }
+        results.append(data_point)
 
     with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-        bench(F.scaled_dot_product_attention, "F.sdpa() - FA", Q, K, V)
+        bench(sdpa, "F.sdpa() - FA", Q, K, V)
 
     with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
-        bench(F.scaled_dot_product_attention, "F.sdpa() - CuDNN", Q, K, V)
+        bench(sdpa, "F.sdpa() - CuDNN", Q, K, V)
 
-    compiled_flex_attention = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=False)
-    bench(compiled_flex_attention, "FlexAttention", Q, K, V)
+    bench(flex_attn, "FlexAttention", Q, K, V)
 
     if flash_attn is not None:
-        bench(flash_attn, "flash-attn", Q, K, V)
+        bench(flash_attn.flash_attn_func, "flash-attn", Q, K, V)
 
     bench(triton_attn, "Triton", Q, K, V)
-    bench(triton_scaled_qk_attn, "Triton qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, check=False)
-    bench(triton_scaled_qk_attn, "Triton qk-fp8", Q_f8, K_f8, V, scale_Q_f8, scale_K_f8, check=False)
 
-    df = pd.DataFrame(results, columns=["Kernel", "Latency (ms)", "TFLOPS", "% SOL"])
+    # TODO: correctness check
+    bench(triton_attn, "Triton qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, check=False)
+    bench(triton_attn, "Triton qk-fp8", Q_f8, K_f8, V, scale_Q_f8, scale_K_f8, check=False)
+
+    df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
