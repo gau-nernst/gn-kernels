@@ -28,6 +28,15 @@ Available kernels
 
 ## Speed benchmarks
 
+### Realistic SOL
+
+Sweep over large matmul shapes and get the max achieved TFLOPS.
+
+Device name | BF16 | INT8 | FP8 | MXFP8 | NVFP4
+------------|------|------|-----|-------|------
+5090 @ 600W | 245.80 | 726.34 | 480.37 | 659.95 | 1306.48
+5090 @ 400W | 229.55 | 602.79 | 447.50 | 552.20 | 1165.04
+
 ### Matmul
 
 RTX 5090 TFLOPS @ 400W. See [`benchmark_mm.py`](benchmark_mm.py) (might need better configs for FP16. Use default Cutlass INT4 GEMM)
