@@ -52,7 +52,7 @@ def _grid(meta):
 # re-tune when stride changes i.e. transpose configuration
 @triton.autotune(
     configs=configs,
-    key=["M", "N", "K", "stride_A", "stride_B", "ROW_SCALE"],
+    key=["M", "N", "K", "stride_A", "stride_B"],
 )
 @triton.jit
 def triton_mm_kernel(
@@ -72,7 +72,6 @@ def triton_mm_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr = 8,
     ACC_DTYPE: tl.constexpr = None,
-    ROW_SCALE: tl.constexpr = False,
 ):
     # based on triton.ops.matmul
     pid = tl.program_id(0)
@@ -109,10 +108,11 @@ def triton_mm_kernel(
     idx_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     idx_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
 
-    if ROW_SCALE:
+    if scale_A_ptr is not None:
         scale_A = tl.load(scale_A_ptr + idx_m, mask=idx_m < M)
         acc = acc.to(tl.float32) * scale_A.to(tl.float32)
 
+    if scale_B_ptr is not None:
         scale_B = tl.load(scale_B_ptr + idx_n, mask=idx_n < N)
         acc = acc.to(tl.float32) * scale_B.to(tl.float32)
 
@@ -135,48 +135,28 @@ def triton_mm(
     _, N = B.shape
 
     # row-scaled matmul
-    if scale_A is not None and scale_B is not None:
+    if scale_A is not None:
         assert scale_A.shape == (M, 1)
-        assert scale_B.shape == (1, N)
         assert scale_A.is_contiguous()
+
+    if scale_B is not None:
+        assert scale_B.shape == (1, N)
         assert scale_B.is_contiguous()
-        ROW_SCALE = True
-        if out_dtype is None:
+
+    if out_dtype is None:
+        if A.dtype in (torch.float32, torch.float16, torch.bfloat16):
+            out_dtype = A.dtype
+        elif A.is_floating_point() or scale_A is not None or scale_B is not None:  # FP8 or row-scaled mm
             out_dtype = torch.bfloat16
-
-    # normal matmul
-    else:
-        ROW_SCALE = False
-        if out_dtype is None:
-            if A.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                out_dtype = A.dtype
-            elif A.is_floating_point():  # FP8
-                out_dtype = torch.bfloat16
-            else:
-                out_dtype = torch.int32
-
-    C = A.new_empty(M, N, dtype=out_dtype)
+        else:
+            out_dtype = torch.int32
 
     # map PyTorch dtype to Triton dtype
     if acc_dtype is not None:
         acc_dtype = {torch.float32: tl.float32, torch.float16: tl.float16, torch.int32: tl.int32}[acc_dtype]
 
-    triton_mm_kernel[_grid](
-        A,
-        B,
-        C,
-        scale_A,
-        scale_B,
-        M,
-        N,
-        K,
-        A.stride(),
-        B.stride(),
-        C.stride(),
-        ACC_DTYPE=acc_dtype,
-        ROW_SCALE=ROW_SCALE,
-    )
-
+    C = A.new_empty(M, N, dtype=out_dtype)
+    triton_mm_kernel[_grid](A, B, C, scale_A, scale_B, M, N, K, A.stride(), B.stride(), C.stride(), ACC_DTYPE=acc_dtype)
     return C
 
 

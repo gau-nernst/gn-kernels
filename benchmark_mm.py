@@ -132,14 +132,14 @@ if __name__ == "__main__":
 
         # INT4
         A_i8_ref = torch.randint(-8, 7, size=(M, K), dtype=torch.int8)
-        B_i8_ref_t = torch.randint(-8, 7, size=(N, K), dtype=torch.int8).T
+        B_i8_ref = torch.randint(-8, 7, size=(N, K), dtype=torch.int8).T
         A_i4 = pack_int4(A_i8_ref)
-        B_i4 = pack_int4(B_i8_ref_t).T
+        B_i4 = pack_int4(B_i8_ref.T).contiguous().T
 
-        i4_cutlass_tflops = bench_tflops(cutlass_int4_mm, torch._int_mm(A_i8_ref, B_i8_ref_t), A_i4, B_i4)
+        i4_cutlass_tflops = bench_tflops(cutlass_int4_mm, torch._int_mm(A_i8_ref, B_i8_ref), A_i4, B_i4)
         scaled_i4_cutlass_tflops = bench_tflops(
             cutlass_row_scaled_int4_mm,
-            scaled_mm_ref(A_i8_ref, B_i8_ref_t, scale_A, scale_B),
+            scaled_mm_ref(A_i8_ref, B_i8_ref, scale_A, scale_B),
             A_i4,
             B_i4,
             scale_A,

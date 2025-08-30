@@ -49,20 +49,20 @@ Note:
 
 |                                   |   1024 |   2048 |    4096 |   Theoretical |
 |:----------------------------------|-------:|-------:|--------:|--------------:|
-| PyTorch (CuBLAS) BF16             |  87.38 | 167.77 |  176.84 |         209.5 |
-| Triton FP16 w/ FP16 accumulate    | 149.8  | 288.95 |  273.5  |         419   |
-| Triton FP8                        | 118.15 | 190.65 |  217.22 |         419   |
-| Cutlass FP8                       | 116.11 | 310.33 |  383.21 |         419   |
-| PyTorch (CuBLAS) INT8             | 209.72 | 466.03 |  592.49 |         838   |
-| Triton INT8                       | 171.2  | 466.03 |  524.22 |         838   |
-| Cutlass INT4                      |  18.08 |  73.58 |   74.77 |           0   |
-| Inductor (Triton) row-scaled FP8  | 116.51 | 190.04 |  214.02 |         419   |
-| Triton row-scaled FP8             | 116.31 | 190.45 |  217.17 |         419   |
-| Cutlass row-scaled FP8            | 116.51 | 310.15 |  383.41 |         419   |
-| Triton block2d-scaled FP8         |  69.91 | 161.22 |  192.94 |         419   |
-| Inductor (Triton) row-scaled INT8 | 149.8  | 400.35 |  520.22 |         838   |
-| Triton row-scaled INT8            | 149.8  | 493.45 |  540.59 |         838   |
-| Triton block2d-scaled INT8        | 149.13 | 380.76 |  453.37 |         838   |
-| Cutlass row-scaled INT4           |  17.72 |  72.52 |   73.86 |           0   |
+| PyTorch (CuBLAS) BF16             |  87.38 | 167.77 |  176.99 |         209.5 |
+| Triton FP16 w/ FP16 accumulate    | 149.8  | 288.95 |  273.77 |         419   |
+| Triton FP8                        | 116.71 | 190.58 |  217.19 |         419   |
+| Cutlass FP8                       | 116.11 | 310.33 |  383.41 |         419   |
+| PyTorch (CuBLAS) INT8             | 209.72 | 466.03 |  593.8  |         838   |
+| Triton INT8                       | 173.41 | 466.03 |  524.29 |         838   |
+| Cutlass INT4                      |  18.08 |  73.58 |   74.73 |           0   |
+| Inductor (Triton) row-scaled FP8  | 116.51 | 189.77 |  214.27 |         419   |
+| Triton row-scaled FP8             | 116.11 | 190.45 |  216.83 |         419   |
+| Cutlass row-scaled FP8            | 116.51 | 310.15 |  387.6  |         419   |
+| Triton block2d-scaled FP8         |  69.91 | 161.22 |  192.85 |         419   |
+| Inductor (Triton) row-scaled INT8 | 149.46 | 400.35 |  520.22 |         838   |
+| Triton row-scaled INT8            | 173.41 | 493.45 |  541.41 |         838   |
+| Triton block2d-scaled INT8        | 148.8  | 381.03 |  453.44 |         838   |
+| Cutlass row-scaled INT4           |  17.72 |  72.91 |   73.86 |           0   |
 | Cutlass MXFP4                     | 209.72 | 709.21 | 1099.58 |        1676   |
 | Cutlass NVFP4                     | 209.72 | 699.05 | 1100.43 |        1676   |
