@@ -49,91 +49,13 @@ def _grid(meta):
 
 # templated matmul from pytorch
 # https://github.com/pytorch/pytorch/blob/c2e2602ecdc2ec1f120e19198dfc18fc39f7bd09/torch/_inductor/kernel/mm.py
-# also re-tune when stride changes i.e. transpose configuration
-@triton.autotune(configs=configs, key=["M", "N", "K", "stride_ak", "stride_bk"])
+# re-tune when stride changes i.e. transpose configuration
+@triton.autotune(
+    configs=configs,
+    key=["M", "N", "K", "stride_A", "stride_B", "ROW_SCALE"],
+)
 @triton.jit
-def mm_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    ACC_DTYPE: tl.constexpr,
-    EVEN_K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr = 8,
-):
-    # based on triton.ops.matmul
-    pid = tl.program_id(0)
-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
-
-    # re-order program ID for better L2 performance
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // (group_size)
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    A = A_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
-    for k in range(K, 0, -BLOCK_K):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            a = tl.load(A, mask=rk[None, :] < k, other=0.0)
-            b = tl.load(B, mask=rk[:, None] < k, other=0.0)
-        acc += tl.dot(a, b, out_dtype=ACC_DTYPE)
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
-
-    # rematerialize rm and rn to save registers
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    idx_m = rm[:, None]
-    idx_n = rn[None, :]
-    mask = (idx_m < M) & (idx_n < N)
-
-    # inductor generates a suffix
-    xindex = idx_m * stride_cm + idx_n * stride_cn
-    tl.store(C_ptr + tl.broadcast_to(xindex, mask.shape), acc, mask)
-
-
-def triton_mm(A: Tensor, B: Tensor, out_dtype: torch.dtype | None = None, acc_dtype: torch.dtype | None = None):
-    out_dtype = out_dtype or A.dtype
-    if acc_dtype is None:
-        ACC_DTYPE_TRITON = tl.float32 if A.dtype.is_floating_point else tl.int32
-    else:
-        ACC_DTYPE_TRITON = {torch.float32: tl.float32, torch.float16: tl.float16, torch.int32: tl.int32}[acc_dtype]
-    assert A.shape[1] == B.shape[0]
-    M, K = A.shape
-    _, N = B.shape
-    EVEN_K = K % 2 == 0
-    C = torch.empty(M, N, dtype=out_dtype, device=A.device)
-    mm_kernel[_grid](A, B, C, M, N, K, *A.stride(), *B.stride(), *C.stride(), ACC_DTYPE_TRITON, EVEN_K)
-    return C
-
-
-@triton.autotune(configs=configs, key=["M", "N", "K", "stride_ak", "stride_bk"])
-@triton.jit
-def row_scaled_mm_kernel(
+def triton_mm_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
@@ -142,23 +64,20 @@ def row_scaled_mm_kernel(
     M,
     N,
     K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_A,
+    stride_B,
+    stride_C,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    ACC_DTYPE: tl.constexpr,
     GROUP_M: tl.constexpr = 8,
-    EVEN_K: tl.constexpr = True,
+    ACC_DTYPE: tl.constexpr = None,
+    ROW_SCALE: tl.constexpr = False,
 ):
     # based on triton.ops.matmul
     pid = tl.program_id(0)
-    grid_m = (M + BLOCK_M - 1) // BLOCK_M
-    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
 
     # re-order program ID for better L2 performance
     width = GROUP_M * grid_n
@@ -172,37 +91,93 @@ def row_scaled_mm_kernel(
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
-    A = A_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+    A = A_ptr + (ram[:, None] * stride_A[0] + rk[None, :] * stride_A[1])
+    B = B_ptr + (rk[:, None] * stride_B[0] + rbn[None, :] * stride_B[1])
 
+    if ACC_DTYPE is None:
+        ACC_DTYPE = tl.float32 if A_ptr.type.element_ty.is_floating() else tl.int32
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+
     for k in range(K, 0, -BLOCK_K):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            a = tl.load(A, mask=rk[None, :] < k, other=0.0)
-            b = tl.load(B, mask=rk[:, None] < k, other=0.0)
-        acc += tl.dot(a, b)
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
+        a = tl.load(A, mask=rk[None, :] < k, other=0.0)
+        b = tl.load(B, mask=rk[:, None] < k, other=0.0)
+        acc += tl.dot(a, b, out_dtype=ACC_DTYPE)
+        A += BLOCK_K * stride_A[1]
+        B += BLOCK_K * stride_B[0]
 
     # rematerialize rm and rn to save registers
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    idx_m = rm[:, None]
-    idx_n = rn[None, :]
-    mask = (idx_m < M) & (idx_n < N)
+    idx_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    idx_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
 
-    scale_A = tl.load(scale_A_ptr + idx_m, mask=idx_m < M)
-    acc = acc.to(tl.float32) * scale_A.to(tl.float32)
+    if ROW_SCALE:
+        scale_A = tl.load(scale_A_ptr + idx_m, mask=idx_m < M)
+        acc = acc.to(tl.float32) * scale_A.to(tl.float32)
 
-    scale_B = tl.load(scale_B_ptr + idx_n, mask=idx_n < N)
-    acc = acc.to(tl.float32) * scale_B.to(tl.float32)
+        scale_B = tl.load(scale_B_ptr + idx_n, mask=idx_n < N)
+        acc = acc.to(tl.float32) * scale_B.to(tl.float32)
 
     # inductor generates a suffix
-    xindex = idx_m * stride_cm + idx_n * stride_cn
-    tl.store(C_ptr + tl.broadcast_to(xindex, mask.shape), acc, mask)
+    xindex = idx_m * stride_C[0] + idx_n * stride_C[1]
+    tl.store(C_ptr + xindex, acc, mask=(idx_m < M) & (idx_n < N))
+
+
+def triton_mm(
+    A: Tensor,
+    B: Tensor,
+    scale_A: Tensor | None = None,
+    scale_B: Tensor | None = None,
+    *,
+    out_dtype: torch.dtype | None = None,
+    acc_dtype: torch.dtype | None = None,
+):
+    assert A.shape[1] == B.shape[0]
+    M, K = A.shape
+    _, N = B.shape
+
+    # row-scaled matmul
+    if scale_A is not None and scale_B is not None:
+        assert scale_A.shape == (M, 1)
+        assert scale_B.shape == (1, N)
+        assert scale_A.is_contiguous()
+        assert scale_B.is_contiguous()
+        ROW_SCALE = True
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+
+    # normal matmul
+    else:
+        ROW_SCALE = False
+        if out_dtype is None:
+            if A.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                out_dtype = A.dtype
+            elif A.is_floating_point():  # FP8
+                out_dtype = torch.bfloat16
+            else:
+                out_dtype = torch.int32
+
+    C = A.new_empty(M, N, dtype=out_dtype)
+
+    # map PyTorch dtype to Triton dtype
+    if acc_dtype is not None:
+        acc_dtype = {torch.float32: tl.float32, torch.float16: tl.float16, torch.int32: tl.int32}[acc_dtype]
+
+    triton_mm_kernel[_grid](
+        A,
+        B,
+        C,
+        scale_A,
+        scale_B,
+        M,
+        N,
+        K,
+        A.stride(),
+        B.stride(),
+        C.stride(),
+        ACC_DTYPE=acc_dtype,
+        ROW_SCALE=ROW_SCALE,
+    )
+
+    return C
 
 
 @triton.autotune(
@@ -328,13 +303,12 @@ def block2d_scaled_mm_kernel(
 
 
 # TODO: check if we still need custom op for triton kernels
-lib.define("triton_row_scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B, ScalarType out_dtype) -> Tensor")
 lib.define(
     "triton_block2d_scaled_mm(Tensor A, Tensor B, Tensor scale_A, Tensor scale_B, ScalarType out_dtype) -> Tensor"
 )
 
 
-def triton_scaled_mm(
+def triton_block2d_scaled_mm(
     A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor, out_dtype: torch.dtype = torch.bfloat16
 ) -> Tensor:
     """Matmul for tile-wise quantized A and B. `A` and `B` are both INT8 or FP8 to utilize
@@ -351,46 +325,13 @@ def triton_scaled_mm(
     assert A.ndim == B.ndim == scale_A.ndim == scale_B.ndim == 2
     assert A.shape[1] == B.shape[0]
 
-    # rowscaled
-    if scale_A.shape == (A.shape[0], 1) and scale_B.shape == (1, B.shape[1]):
-        assert scale_A.is_contiguous()
-        assert scale_B.is_contiguous()
-        return lib_ops.triton_row_scaled_mm(A, B, scale_A, scale_B, out_dtype)
-
-    # generic tile-wise scaling
-    else:
-        assert scale_A.shape[1] == scale_B.shape[0]
-        return lib_ops.triton_block2d_scaled_mm(A, B, scale_A, scale_B, out_dtype)
+    assert scale_A.shape[1] == scale_B.shape[0]
+    return lib_ops.triton_block2d_scaled_mm(A, B, scale_A, scale_B, out_dtype)
 
 
-@torch.library.impl(lib, "triton_row_scaled_mm", "Meta")
 @torch.library.impl(lib, "triton_block2d_scaled_mm", "Meta")
 def _(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor, out_dtype: torch.dtype):
     return torch.empty((A.shape[0], B.shape[1]), device=A.device, dtype=out_dtype)
-
-
-@torch.library.impl(lib, "triton_row_scaled_mm", "CUDA")
-def _(A: Tensor, B: Tensor, scale_A: Tensor, scale_B: Tensor, out_dtype: torch.dtype):
-    M, K = A.shape
-    _, N = B.shape
-    C = torch.empty(M, N, device=A.device, dtype=out_dtype)
-
-    row_scaled_mm_kernel[_grid](
-        A,
-        B,
-        C,
-        scale_A,
-        scale_B,
-        M,
-        N,
-        K,
-        *A.stride(),
-        *B.stride(),
-        *C.stride(),
-        ACC_DTYPE=tl.int32 if A.dtype == torch.int8 else tl.float32,
-        EVEN_K=K % 2 == 0,
-    )
-    return C
 
 
 @torch.library.impl(lib, "triton_block2d_scaled_mm", "CUDA")
