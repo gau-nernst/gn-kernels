@@ -72,9 +72,13 @@ if __name__ == "__main__":
 
     Q_i8, scale_Q_i8 = quantize(Q, torch.int8)
     K_i8, scale_K_i8 = quantize(K, torch.int8)
+    scale_Q_i8 = scale_Q_i8.transpose(1, 2).contiguous()
+    scale_K_i8 = scale_K_i8.transpose(1, 2).contiguous()
 
     Q_f8, scale_Q_f8 = quantize(Q, torch.float8_e4m3fn)
     K_f8, scale_K_f8 = quantize(K, torch.float8_e4m3fn)
+    scale_Q_f8 = scale_Q_f8.transpose(1, 2).contiguous()
+    scale_K_f8 = scale_K_f8.transpose(1, 2).contiguous()
 
     SOL_LOOKUP = {
         "NVIDIA GeForce RTX 5090": 209.5,

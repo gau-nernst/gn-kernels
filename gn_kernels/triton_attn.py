@@ -13,6 +13,10 @@ def _triton_attn_kernel(
     O_ptr,  # [BS, LEN_Q, NUM_HEADS, DIM_V]
     scale_Q_ptr,  # [BS, NUM_HEADS, LEN_Q]
     scale_K_ptr,  # [BS, NUM_HEADS, LEN_KV]
+    stride_Q,
+    stride_K,
+    stride_V,
+    stride_O,
     LEN_Q: int,
     LEN_KV: int,
     NUM_HEADS: int,
@@ -28,10 +32,10 @@ def _triton_attn_kernel(
     head_id = tl.program_id(1)
     bs_id = tl.program_id(2)
 
-    Q_ptr += ((bs_id * LEN_Q * NUM_HEADS) + (pid_m * BLOCK_M * NUM_HEADS) + head_id) * DIM_QK
-    K_ptr += ((bs_id * LEN_KV * NUM_HEADS) + head_id) * DIM_QK
-    V_ptr += ((bs_id * LEN_KV * NUM_HEADS) + head_id) * DIM_V
-    O_ptr += ((bs_id * LEN_Q * NUM_HEADS) + (pid_m * BLOCK_M * NUM_HEADS) + head_id) * DIM_V
+    Q_ptr += (bs_id * stride_Q[0]) + (pid_m * BLOCK_M * stride_Q[1]) + (head_id * stride_Q[2])
+    K_ptr += (bs_id * stride_K[0]) + (head_id * stride_K[2])
+    V_ptr += (bs_id * stride_V[0]) + (head_id * stride_V[2])
+    O_ptr += (bs_id * stride_O[0]) + (pid_m * BLOCK_M * stride_O[1]) + (head_id * stride_O[2])
     if SCALED_QK:
         scale_Q_ptr += (bs_id * NUM_HEADS * LEN_Q) + (head_id * LEN_Q) + (pid_m * BLOCK_M)
         scale_K_ptr += (bs_id * NUM_HEADS * LEN_KV) + (head_id * LEN_KV)
@@ -40,7 +44,7 @@ def _triton_attn_kernel(
     Q_block_ptr = tl.make_block_ptr(
         base=Q_ptr,
         shape=(LEN_Q, DIM_QK),
-        strides=(NUM_HEADS * DIM_QK, 1),
+        strides=(stride_Q[1], 1),
         offsets=(0, 0),
         block_shape=(BLOCK_M, DIM_QK),
         order=(1, 0),
@@ -48,7 +52,7 @@ def _triton_attn_kernel(
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr,
         shape=(DIM_QK, LEN_KV),
-        strides=(1, NUM_HEADS * DIM_QK),
+        strides=(1, stride_K[1]),
         offsets=(0, 0),
         block_shape=(DIM_QK, BLOCK_N),
         order=(0, 1),
@@ -56,7 +60,7 @@ def _triton_attn_kernel(
     V_block_ptr = tl.make_block_ptr(
         base=V_ptr,
         shape=(LEN_KV, DIM_V),
-        strides=(NUM_HEADS * DIM_V, 1),
+        strides=(stride_V[1], 1),
         offsets=(0, 0),
         block_shape=(BLOCK_N, DIM_V),
         order=(1, 0),
@@ -121,7 +125,7 @@ def _triton_attn_kernel(
     O_block_ptr = tl.make_block_ptr(
         base=O_ptr,
         shape=(LEN_Q, DIM_V),
-        strides=(NUM_HEADS * DIM_V, 1),
+        strides=(stride_O[1], 1),
         offsets=(0, 0),
         block_shape=(BLOCK_M, DIM_V),
         order=(1, 0),
@@ -160,14 +164,32 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
     _, LEN_KV, _, DIM_V = v.shape
     assert k.shape == (BS, LEN_KV, NUM_HEADS, DIM_QK)
     assert v.shape == (BS, LEN_KV, NUM_HEADS, DIM_V)
-    assert q.is_contiguous()
-    assert k.is_contiguous()
-    assert v.is_contiguous()
+    assert q.stride(-1) == 1
+    assert k.stride(-1) == 1
+    assert v.stride(-1) == 1
 
     def grid(args):
         return (triton.cdiv(LEN_Q, args["BLOCK_M"]), NUM_HEADS, BS)
 
     o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V)
+
+    kwargs = dict(
+        Q_ptr=q,
+        K_ptr=k,
+        V_ptr=v,
+        O_ptr=o,
+        scale_Q_ptr=scale_q,
+        scale_K_ptr=scale_k,
+        stride_Q=q.stride(),
+        stride_K=k.stride(),
+        stride_V=v.stride(),
+        stride_O=o.stride(),
+        LEN_Q=LEN_Q,
+        LEN_KV=LEN_KV,
+        NUM_HEADS=NUM_HEADS,
+        DIM_QK=DIM_QK,
+        DIM_V=DIM_V,
+    )
 
     if scale_q is not None and scale_k is not None:
         assert scale_q.shape == (BS, NUM_HEADS, LEN_Q)
@@ -175,9 +197,9 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
         assert scale_q.is_contiguous()
         assert scale_k.is_contiguous()
 
-        triton_scaled_qk_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, DIM_QK, DIM_V)
+        triton_scaled_qk_attn_kernel[grid](**kwargs)
 
     else:
-        triton_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, DIM_QK, DIM_V)
+        triton_attn_kernel[grid](**kwargs)
 
     return o
