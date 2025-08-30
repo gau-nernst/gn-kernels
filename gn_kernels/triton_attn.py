@@ -1,5 +1,6 @@
 # https://github.com/triton-lang/triton/blob/v3.3.1/python/tutorials/06-fused-attention.py
 
+import torch
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -171,7 +172,7 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
     def grid(args):
         return (triton.cdiv(LEN_Q, args["BLOCK_M"]), NUM_HEADS, BS)
 
-    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V)
+    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V, dtype=torch.bfloat16)
 
     kwargs = dict(
         Q_ptr=q,
