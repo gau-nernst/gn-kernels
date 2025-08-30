@@ -173,8 +173,8 @@ void mma_m16n8k32_mxfp8(uint32_t A[4], uint32_t B[2], float D[4],
 template <typename T, typename... Args>
 void launch_kernel(
   T *kernel,
-  int num_blocks,
-  int block_size,
+  dim3 num_blocks,
+  dim3 block_size,
   int smem_size,
   cudaStream_t stream,
   Args... args) {

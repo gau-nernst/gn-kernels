@@ -19,27 +19,31 @@ template<int BLOCK_Q, int BLOCK_KV, int DIM, int NUM_WARPS>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void sm80_attn_int8_qk_kernel(
-  const TypeQK *Q,           // [bs, len_q, DIM]
-  const TypeQK *K,           // [bs, len_kv, DIM]
-  const TypeV *V,            // [bs, len_kv, DIM]
-  const TypeScale *scale_Q,  // [bs, len_q]
-  const TypeScale *scale_K,  // [bs, len_kv]
-  nv_bfloat16 *O,            // [bs, len_q, DIM]
+  const TypeQK *Q_gmem,           // [bs, len_q, num_heads, DIM]
+  const TypeQK *K_gmem,           // [bs, len_kv, num_heads, DIM]
+  const TypeV *V_gmem,            // [bs, len_kv, num_heads, DIM]
+  const TypeScale *scale_Q_gmem,  // [bs, num_heads, len_q]
+  const TypeScale *scale_K_gmem,  // [bs, num_heads, len_kv]
+  nv_bfloat16 *O_gmem,            // [bs, len_q, num_heads, DIM]
+  int3 Q_stride,
+  int3 K_stride,
+  int3 V_stride,
+  int3 O_stride,
   int bs,
   int len_q,
-  int len_kv) {
-
+  int len_kv,
+  int num_heads
+) {
   constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
-  const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
 
   // each threadblock handles 1 BLOCK_Q
-  const int num_q_blocks = cdiv(len_q, BLOCK_Q);
-  const int bs_id = bid / num_q_blocks;
-  const int q_block_id = bid % num_q_blocks;
+  const int q_block_id = blockIdx.x;
+  const int head_id = blockIdx.y;
+  const int bs_id = blockIdx.z;
 
   // FA2: shard BLOCK_Q among all warps
   // replicate K and V on all warps
@@ -51,12 +55,13 @@ void sm80_attn_int8_qk_kernel(
   constexpr int MMA_K_BF16 = 16;
   constexpr int MMA_K_INT8 = 32;
 
-  Q += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;
-  K += bs_id * len_kv * DIM;
-  V += bs_id * len_kv * DIM;
-  scale_Q += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q;
-  scale_K += bs_id * len_kv;
-  O += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;
+  const int q_offset = q_block_id * BLOCK_Q;
+  Q_gmem += (bs_id * Q_stride.x) + (q_offset * Q_stride.y) + (head_id * Q_stride.z);
+  K_gmem += (bs_id * K_stride.x) + (head_id * K_stride.z);
+  V_gmem += (bs_id * V_stride.x) + (head_id * V_stride.z);
+  scale_Q_gmem += (bs_id * num_heads * len_q) + (head_id * len_q) + q_offset;
+  scale_K_gmem += (bs_id * num_heads * len_kv) + (head_id * len_kv);
+  O_gmem += (bs_id * O_stride.x) + (q_offset * O_stride.y) + (head_id * O_stride.z);
 
   // we overlap (Q_smem + scale_Q_smem) with (K_smem + scale_K_smem + V_smem)
   // since we only need to load (Q_smem + scale_Q_smem) once
@@ -64,11 +69,10 @@ void sm80_attn_int8_qk_kernel(
   const uint32_t Q_smem = __cvta_generic_to_shared(smem);
   const uint32_t scale_Q_smem = Q_smem + BLOCK_Q * DIM * sizeof(TypeQK);
 
-  // double buffer for K and scale_K
+  // double buffer for K, V, and scale_K
   const uint32_t K_smem = Q_smem;
-  const uint32_t scale_K_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeQK);
-
-  const uint32_t V_smem = scale_K_smem + 2 * BLOCK_KV * sizeof(TypeScale);
+  const uint32_t V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeQK);
+  const uint32_t scale_K_smem = V_smem + BLOCK_KV * DIM * sizeof(TypeV);
 
   // pre-compute address and swizzling for ldmatrix
   uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
@@ -118,9 +122,10 @@ void sm80_attn_int8_qk_kernel(
 
   // load Q [BLOCK_Q, DIM]
   {
-    global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
+    global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q_gmem, Q_stride.y, tid);
+    // TODO: make a separate no swizzling cp.async
     constexpr int width = 16 / sizeof(TypeScale);  // no swizzling
-    global_to_shared_swizzle<BLOCK_Q / width, width, TB_SIZE>(scale_Q_smem, scale_Q, width, tid);
+    global_to_shared_swizzle<BLOCK_Q / width, width, TB_SIZE>(scale_Q_smem, scale_Q_gmem, width, tid);
     asm volatile("cp.async.commit_group;");
     asm volatile("cp.async.wait_all;");
   }
@@ -155,22 +160,23 @@ void sm80_attn_int8_qk_kernel(
 
   auto load_K = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
-      // double buffer for K
-      const uint32_t K_dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK);
-      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_dst, K, DIM, tid);
-      K += BLOCK_KV * DIM;
-
-      const uint32_t scale_K_dst = scale_K_smem + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale);
-      constexpr int width = 16 / sizeof(TypeScale);  // no swizzling
-      global_to_shared_swizzle<BLOCK_KV / width, width, TB_SIZE>(scale_K_dst, scale_K, width, tid);
-      scale_K += BLOCK_KV;
+      {
+        const uint32_t dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK);
+        global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, K_gmem, K_stride.y, tid);
+        K_gmem += BLOCK_KV * K_stride.y;
+      }
+      {
+        const uint32_t dst = scale_K_smem + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale);
+        constexpr int width = 16 / sizeof(TypeScale);  // no swizzling
+        global_to_shared_swizzle<BLOCK_KV / width, width, TB_SIZE>(dst, scale_K_gmem, width, tid);
+        scale_K_gmem += BLOCK_KV;
+      }
     }
     asm volatile("cp.async.commit_group;");
   };
   auto load_V = [&](int kv_id) {
-    // single buffer for V
-    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_smem, V, DIM, tid);
-    V += BLOCK_KV * DIM;
+    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_smem, V_gmem, V_stride.y, tid);
+    V_gmem += BLOCK_KV * V_stride.y;
     asm volatile("cp.async.commit_group;");
   };
 
@@ -181,8 +187,8 @@ void sm80_attn_int8_qk_kernel(
     int32_t QK_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
     // prefetch V
-    // __syncthreads() here is required to make sure we finish using V_shm
-    // from the previous iteration, since there is only 1 shared buffer for V.
+    // __syncthreads() is required to make sure we finish using shared memory
+    // from the previous iteration.
     __syncthreads();
     load_V(kv_id);
 
@@ -319,7 +325,7 @@ void sm80_attn_int8_qk_kernel(
         ldmatrix_trans<4>(V_rmem[mma_id_kv][mma_id_d], addr);
       }
 
-    // MMA P = S @ V [BLOCK_Q, DIM]
+    // MMA O += P @ V [BLOCK_Q, DIM]
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K_BF16; mma_id_kv++)
@@ -341,30 +347,31 @@ void sm80_attn_int8_qk_kernel(
       regs[2] /= rowsumexp[mma_id_q][1];
       regs[3] /= rowsumexp[mma_id_q][1];
 
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 0) * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
-      reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+      reinterpret_cast<nv_bfloat162 *>(O_gmem + (row + 0) * O_stride.y + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
+      reinterpret_cast<nv_bfloat162 *>(O_gmem + (row + 8) * O_stride.y + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
     }
 }
 
 at::Tensor sm80_attn_int8_qk(
-  const at::Tensor& Q,        // [bs, num_heads, len_q, dim]
-  const at::Tensor& K,        // [bs, num_heads, len_kv, dim]
-  const at::Tensor& V,        // [bs, num_heads, len_kv, dim]
-  const at::Tensor& scale_Q,  // [bs, num_heads, len_q, dim/32] - kinda
-  const at::Tensor& scale_K) {
-
-  int bs = Q.size(0) * Q.size(1);
-  int len_q = Q.size(2);
-  int len_kv = K.size(2);
+  const at::Tensor& Q,        // [bs, len_q, num_heads, dim]
+  const at::Tensor& K,        // [bs, len_kv, num_heads, dim]
+  const at::Tensor& V,        // [bs, len_kv, num_heads, dim]
+  const at::Tensor& scale_Q,  // [bs, num_heads, len_q]
+  const at::Tensor& scale_K   // [bs, num_heads, len_kv]
+) {
+  int bs = Q.size(0);
+  int len_q = Q.size(1);
+  int len_kv = K.size(1);
+  int num_heads = Q.size(2);
   int dim = Q.size(3);
 
   TORCH_CHECK(dim == 128, "Only supports dim=128");
   TORCH_CHECK(scale_Q.dtype() == at::kFloat);
   TORCH_CHECK(scale_K.dtype() == at::kFloat);
 
-  TORCH_CHECK(Q.is_contiguous());
-  TORCH_CHECK(K.is_contiguous());
-  TORCH_CHECK(V.is_contiguous());
+  TORCH_CHECK(Q.stride(-1) == 1);
+  TORCH_CHECK(K.stride(-1) == 1);
+  TORCH_CHECK(V.stride(-1) == 1);
   TORCH_CHECK(scale_Q.is_contiguous());
   TORCH_CHECK(scale_K.is_contiguous());
 
@@ -377,22 +384,31 @@ at::Tensor sm80_attn_int8_qk(
   auto scale_K_ptr = reinterpret_cast<const TypeScale *>(scale_K.data_ptr());
   auto O_ptr = reinterpret_cast<nv_bfloat16 *>(O.data_ptr());
 
+  // get strides for the first 3 dims, since the last dim's stride is 1
+  auto get_stride = [](const at::Tensor& x) {
+    return int3{static_cast<int>(x.stride(0)),
+                static_cast<int>(x.stride(1)),
+                static_cast<int>(x.stride(2))};
+  };
+
   const int BLOCK_Q = 64;
   const int BLOCK_KV = 64;
   const int DIM = 128;
   const int NUM_WARPS = 4;
 
-  const int num_blocks = bs * cdiv(len_q, BLOCK_Q);
+  const dim3 num_blocks(cdiv(len_q, BLOCK_Q), num_heads, bs);
   const int TB_SIZE = NUM_WARPS * WARP_SIZE;
   const int Q_smem_size = BLOCK_Q * (DIM * sizeof(TypeQK) + sizeof(TypeScale));
   const int K_smem_size = 2 * BLOCK_KV * (DIM * sizeof(TypeQK) + sizeof(TypeScale));
   const int V_smem_size = BLOCK_KV * DIM * sizeof(TypeV);
-  const int smem_size = max(Q_smem_size, K_smem_size + V_smem_size);
+  const int smem_size = max(Q_smem_size, (K_smem_size + V_smem_size));
 
   auto kernel = sm80_attn_int8_qk_kernel<BLOCK_Q, BLOCK_KV, DIM, NUM_WARPS>;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   launch_kernel(kernel, num_blocks, TB_SIZE, smem_size, stream,
-                Q_ptr, K_ptr, V_ptr, scale_Q_ptr, scale_K_ptr, O_ptr, bs, len_q, len_kv);
+                Q_ptr, K_ptr, V_ptr, scale_Q_ptr, scale_K_ptr, O_ptr,
+                get_stride(Q), get_stride(K), get_stride(V), get_stride(O),
+                bs, len_q, len_kv, num_heads);
 
   return O;
 }

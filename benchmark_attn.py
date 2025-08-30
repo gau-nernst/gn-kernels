@@ -15,7 +15,7 @@ try:
 except ImportError:
     flash_attn = None
 
-from gn_kernels import triton_attn
+from gn_kernels import attn_int8_qk, triton_attn
 
 
 # add a small offset so that output does not have a mean of zero,
@@ -54,14 +54,7 @@ def dequantize(xq: Tensor, scale: Tensor):
     return xq.float() * scale.float().unsqueeze(-1)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bs", type=int, default=4)
-    parser.add_argument("--nh", type=int, default=8)
-    parser.add_argument("--lq", type=int, default=4096)
-    parser.add_argument("--lkv", type=int, default=8192)
-    args = parser.parse_args()
-
+def main(args: argparse.Namespace):
     bs = args.bs
     nh = args.nh
     lq = args.lq
@@ -70,7 +63,6 @@ if __name__ == "__main__":
 
     torch.set_default_device("cuda")
     torch.manual_seed(2025 * 2026)
-    COMPUTE_CAPABILITY = torch.cuda.get_device_capability()
 
     Q = generate_input(bs, lq, nh, head_dim)
     K = generate_input(bs, lkv, nh, head_dim)
@@ -85,6 +77,13 @@ if __name__ == "__main__":
     K_f8, scale_K_f8 = quantize(K, torch.float8_e4m3fn)
     scale_Q_f8 = scale_Q_f8.transpose(1, 2).contiguous()
     scale_K_f8 = scale_K_f8.transpose(1, 2).contiguous()
+
+    if args.profile is not None:
+        if args.profile == "triton_qk_int8":
+            triton_attn(Q_i8, K_i8, V, scale_Q_i8, scale_Q_i8)
+        elif args.profile == "cuda_qk_int8":
+            attn_int8_qk(Q_i8, K_i8, V, scale_Q_i8, scale_Q_i8)
+        return
 
     SOL_LOOKUP = {
         "NVIDIA GeForce RTX 5090": 209.5,
@@ -130,6 +129,7 @@ if __name__ == "__main__":
     K_i8_dq = dequantize(K_i8, scale_K_i8.transpose(1, 2))
     qk_i8_ref = sdpa(Q_i8_dq, K_i8_dq, V.float()).bfloat16()
     bench(triton_attn, "Triton qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, out_ref=qk_i8_ref)
+    bench(attn_int8_qk, "CUDA qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, out_ref=qk_i8_ref)
 
     Q_f8_dq = dequantize(Q_f8, scale_Q_f8.transpose(1, 2))
     K_f8_dq = dequantize(K_f8, scale_K_f8.transpose(1, 2))
@@ -138,3 +138,15 @@ if __name__ == "__main__":
 
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bs", type=int, default=4)
+    parser.add_argument("--nh", type=int, default=8)
+    parser.add_argument("--lq", type=int, default=4096)
+    parser.add_argument("--lkv", type=int, default=8192)
+    parser.add_argument("--profile")
+    args = parser.parse_args()
+
+    main(args)

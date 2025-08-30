@@ -22,14 +22,7 @@ def attn_mxfp8_qk(Q: Tensor, K: Tensor, V: Tensor, scale_Q: Tensor, scale_K: Ten
 
 
 def attn_int8_qk(Q: Tensor, K: Tensor, V: Tensor, scale_Q: Tensor, scale_K: Tensor):
-    assert Q.shape[-1] == 128
-    return lib_ops.sm80_attn_int8_qk(
-        Q.contiguous(),
-        K.contiguous(),
-        V.contiguous(),
-        scale_Q.contiguous(),
-        scale_K.contiguous(),
-    )
+    return lib_ops.sm80_attn_int8_qk(Q, K, V, scale_Q.contiguous(), scale_K.contiguous())
 
 
 def attn_int8(Q: Tensor, K: Tensor, V: Tensor, scale_Q: Tensor, scale_K: Tensor, scale_V: Tensor):
