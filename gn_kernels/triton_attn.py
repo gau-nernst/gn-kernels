@@ -1,6 +1,5 @@
 # https://github.com/triton-lang/triton/blob/v3.3.1/python/tutorials/06-fused-attention.py
 
-import torch
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -8,80 +7,77 @@ from torch import Tensor
 
 @triton.jit
 def _triton_attn_kernel(
-    Q_ptr,  # [BS, LEN_Q, NUM_HEADS, HEAD_DIM]
-    K_ptr,  # [BS, LEN_KV, NUM_HEADS, HEAD_DIM]
-    V_ptr,  # [BS, LEN_KV, NUM_HEADS, HEAD_DIM]
-    O_ptr,  # [BS, LEN_Q, NUM_HEADS, HEAD_DIM]
-    scale_Q_ptr,  # [BS, LEN_Q, NUM_HEADS]
-    scale_K_ptr,  # [BS, LEN_KV, NUM_HEADS]
+    Q_ptr,  # [BS, LEN_Q, NUM_HEADS, DIM_QK]
+    K_ptr,  # [BS, LEN_KV, NUM_HEADS, DIM_QK]
+    V_ptr,  # [BS, LEN_KV, NUM_HEADS, DIM_V]
+    O_ptr,  # [BS, LEN_Q, NUM_HEADS, DIM_V]
+    scale_Q_ptr,  # [BS, NUM_HEADS, LEN_Q]
+    scale_K_ptr,  # [BS, NUM_HEADS, LEN_KV]
     LEN_Q: int,
     LEN_KV: int,
     NUM_HEADS: int,
-    HEAD_DIM: tl.constexpr,
+    DIM_QK: tl.constexpr,
+    DIM_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     sm_scale: float | None = None,
     SCALED_QK: tl.constexpr = False,
 ):
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    # tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid_m = tl.program_id(0)  # better L2 reuse for K and V
-    pid_head = tl.program_id(1)
-    pid_bs = tl.program_id(2)
+    head_id = tl.program_id(1)
+    bs_id = tl.program_id(2)
 
-    Q_ptr += (
-        (pid_bs * LEN_Q * NUM_HEADS * HEAD_DIM) + ((pid_m * BLOCK_M) * NUM_HEADS * HEAD_DIM) + (pid_head * HEAD_DIM)
-    )
-    K_ptr += (pid_bs * LEN_KV * NUM_HEADS * HEAD_DIM) + (pid_head * HEAD_DIM)
-    V_ptr += (pid_bs * LEN_KV * NUM_HEADS * HEAD_DIM) + (pid_head * HEAD_DIM)
-    O_ptr += (
-        (pid_bs * LEN_Q * NUM_HEADS * HEAD_DIM) + ((pid_m * BLOCK_M) * NUM_HEADS * HEAD_DIM) + (pid_head * HEAD_DIM)
-    )
+    Q_ptr += ((bs_id * LEN_Q * NUM_HEADS) + (pid_m * BLOCK_M * NUM_HEADS) + head_id) * DIM_QK
+    K_ptr += ((bs_id * LEN_KV * NUM_HEADS) + head_id) * DIM_QK
+    V_ptr += ((bs_id * LEN_KV * NUM_HEADS) + head_id) * DIM_V
+    O_ptr += ((bs_id * LEN_Q * NUM_HEADS) + (pid_m * BLOCK_M * NUM_HEADS) + head_id) * DIM_V
     if SCALED_QK:
-        scale_Q_ptr += (pid_bs * LEN_Q * NUM_HEADS) + ((pid_m * BLOCK_M) * NUM_HEADS) + pid_head
-        scale_K_ptr += (pid_bs * LEN_KV * NUM_HEADS) + pid_head
+        scale_Q_ptr += (bs_id * NUM_HEADS * LEN_Q) + (head_id * LEN_Q) + (pid_m * BLOCK_M)
+        scale_K_ptr += (bs_id * NUM_HEADS * LEN_KV) + (head_id * LEN_KV)
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
         base=Q_ptr,
-        shape=(LEN_Q, HEAD_DIM),
-        strides=(NUM_HEADS * HEAD_DIM, 1),
+        shape=(LEN_Q, DIM_QK),
+        strides=(NUM_HEADS * DIM_QK, 1),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        block_shape=(BLOCK_M, DIM_QK),
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr,
-        shape=(HEAD_DIM, LEN_KV),
-        strides=(1, NUM_HEADS * HEAD_DIM),
+        shape=(DIM_QK, LEN_KV),
+        strides=(1, NUM_HEADS * DIM_QK),
         offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N),
+        block_shape=(DIM_QK, BLOCK_N),
         order=(0, 1),
     )
     V_block_ptr = tl.make_block_ptr(
         base=V_ptr,
-        shape=(LEN_KV, HEAD_DIM),
-        strides=(NUM_HEADS * HEAD_DIM, 1),
+        shape=(LEN_KV, DIM_V),
+        strides=(NUM_HEADS * DIM_V, 1),
         offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
+        block_shape=(BLOCK_N, DIM_V),
         order=(1, 0),
     )
 
     # initialize accumulator
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")  # max
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0  # sumexp
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, DIM_V], dtype=tl.float32)
 
     # e^x = e^(log(2) * x / log(2)) = 2^(x/log(2))
     if sm_scale is None:
-        sm_scale = HEAD_DIM**-0.5
+        sm_scale = DIM_QK**-0.5
     sm_scale *= 1.44269504  # 1/log(2)
 
     # load q: it will stay in SMEM throughout
-    q = tl.load(Q_block_ptr)  # [BLOCK_M, HEAD_DIM]
+    q = tl.load(Q_block_ptr)  # [BLOCK_M, DIM_QK]
 
     if SCALED_QK:
-        scale_q_ptrs = scale_Q_ptr + tl.arange(0, BLOCK_M)[:, None] * NUM_HEADS  # [BLOCK_M, 1]
-        scale_k_ptrs = scale_K_ptr + tl.arange(0, BLOCK_N)[None, :] * NUM_HEADS  # [1, BLOCK_N]
+        scale_q_ptrs = scale_Q_ptr + tl.arange(0, BLOCK_M)[:, None]  # [BLOCK_M, 1]
+        scale_k_ptrs = scale_K_ptr + tl.arange(0, BLOCK_N)[None, :]  # [1, BLOCK_N]
 
         # fused softmax scale to scale_Q
         sm_scale = sm_scale * tl.load(scale_q_ptrs)
@@ -89,7 +85,7 @@ def _triton_attn_kernel(
     # loop over k, v and update accumulator
     for _ in tl.range(0, LEN_KV, BLOCK_N):
         # 1st matmul: S = Q @ K.T
-        k = tl.load(K_block_ptr)  # [HEAD_DIM, BLOCK_N]
+        k = tl.load(K_block_ptr)  # [DIM_QK, BLOCK_N]
 
         out_dtype: tl.constexpr = tl.int32 if q.type == tl.int8 else tl.float32
         qk = tl.dot(q, k, out_dtype=out_dtype)  # [BLOCK_M, BLOCK_N]
@@ -99,7 +95,7 @@ def _triton_attn_kernel(
             # NOTE: this is not pipelined
             scale_k = tl.load(scale_k_ptrs)  # [1, BLOCK_N]
             qk *= scale_k
-            scale_k_ptrs += BLOCK_N * NUM_HEADS
+            scale_k_ptrs += BLOCK_N
 
         # softmax
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -124,10 +120,10 @@ def _triton_attn_kernel(
     acc = acc / l_i[:, None]
     O_block_ptr = tl.make_block_ptr(
         base=O_ptr,
-        shape=(LEN_Q, HEAD_DIM),
-        strides=(NUM_HEADS * HEAD_DIM, 1),
+        shape=(LEN_Q, DIM_V),
+        strides=(NUM_HEADS * DIM_V, 1),
         offsets=(0, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
+        block_shape=(BLOCK_M, DIM_V),
         order=(1, 0),
     )
     tl.store(O_block_ptr, acc.to(O_ptr.type.element_ty))
@@ -159,10 +155,11 @@ triton_scaled_qk_attn_kernel = triton.autotune(
 
 def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, scale_k: Tensor | None = None):
     # TODO: support GQA
-    BS, LEN_Q, NUM_HEADS, HEAD_DIM = q.shape
-    LEN_KV = k.shape[1]
-    assert k.shape == (BS, LEN_KV, NUM_HEADS, HEAD_DIM)
-    assert v.shape == (BS, LEN_KV, NUM_HEADS, HEAD_DIM)
+    # TODO: check if (bs, nh, len, dim) layout is better for int8/fp8
+    BS, LEN_Q, NUM_HEADS, DIM_QK = q.shape
+    _, LEN_KV, _, DIM_V = v.shape
+    assert k.shape == (BS, LEN_KV, NUM_HEADS, DIM_QK)
+    assert v.shape == (BS, LEN_KV, NUM_HEADS, DIM_V)
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -170,17 +167,17 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
     def grid(args):
         return (triton.cdiv(LEN_Q, args["BLOCK_M"]), NUM_HEADS, BS)
 
-    o = torch.empty_like(q)
+    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V)
 
     if scale_q is not None and scale_k is not None:
-        assert scale_q.shape == (BS, LEN_Q, NUM_HEADS)
-        assert scale_k.shape == (BS, LEN_KV, NUM_HEADS)
+        assert scale_q.shape == (BS, NUM_HEADS, LEN_Q)
+        assert scale_k.shape == (BS, NUM_HEADS, LEN_KV)
         assert scale_q.is_contiguous()
         assert scale_k.is_contiguous()
 
-        triton_scaled_qk_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, HEAD_DIM)
+        triton_scaled_qk_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, DIM_QK, DIM_V)
 
     else:
-        triton_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, HEAD_DIM)
+        triton_attn_kernel[grid](q, k, v, o, scale_q, scale_k, LEN_Q, LEN_KV, NUM_HEADS, DIM_QK, DIM_V)
 
     return o
