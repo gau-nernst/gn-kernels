@@ -101,7 +101,7 @@ if __name__ == "__main__":
             scaled_mm_inductor, scaled_mm_ref, A_i8, B_i8, scale_A, scale_B, atol=4e-4, rtol=1e-2
         )
         scaled_i8_triton_tflops = bench_tflops(
-            triton_mm, scaled_mm_ref, A_i8, B_i8, scale_A, scale_B, atol=4e-4, rtol=1e-2
+            triton_mm, scaled_mm_ref, A_i8, B_i8, scale_A=scale_A, scale_B=scale_B, atol=4e-4, rtol=1e-2
         )
         block2d_scaled_i8_triton_tflops = bench_tflops(
             triton_block2d_scaled_mm, scaled_mm_ref, A_i8, B_i8, block2d_scale_A, block2d_scale_B, atol=1e-4, rtol=1e-2
@@ -119,7 +119,9 @@ if __name__ == "__main__":
             scaled_f8_cutlass_tflops = bench_tflops(
                 cutlass_row_scaled_fp8_mm, scaled_mm_ref, A_f8, B_f8, scale_A.float(), scale_B.float()
             )
-            scaled_f8_triton_tflops = bench_tflops(triton_mm, scaled_mm_ref, A_f8, B_f8, scale_A, scale_B)
+            scaled_f8_triton_tflops = bench_tflops(
+                triton_mm, scaled_mm_ref, A_f8, B_f8, scale_A=scale_A, scale_B=scale_B
+            )
             block2d_scaled_f8_triton_tflops = bench_tflops(
                 triton_block2d_scaled_mm, scaled_mm_ref, A_f8, B_f8, block2d_scale_A, block2d_scale_B
             )

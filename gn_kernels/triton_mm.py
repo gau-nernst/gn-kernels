@@ -59,6 +59,7 @@ def triton_mm_kernel(
     A_ptr,
     B_ptr,
     C_ptr,
+    bias_ptr,
     scale_A_ptr,
     scale_B_ptr,
     M,
@@ -116,6 +117,11 @@ def triton_mm_kernel(
         scale_B = tl.load(scale_B_ptr + idx_n, mask=idx_n < N)
         acc = acc.to(tl.float32) * scale_B.to(tl.float32)
 
+    # NOTE: this doesn't consider the case i8xi8=i32 +i32
+    if bias_ptr is not None:
+        bias = tl.load(bias_ptr + idx_n, mask=idx_n < N)
+        acc = acc.to(tl.float32) + bias.to(tl.float32)
+
     # inductor generates a suffix
     xindex = idx_m * stride_C[0] + idx_n * stride_C[1]
     tl.store(C_ptr + xindex, acc, mask=(idx_m < M) & (idx_n < N))
@@ -124,9 +130,10 @@ def triton_mm_kernel(
 def triton_mm(
     A: Tensor,
     B: Tensor,
+    bias: Tensor | None = None,
+    *,
     scale_A: Tensor | None = None,
     scale_B: Tensor | None = None,
-    *,
     out_dtype: torch.dtype | None = None,
     acc_dtype: torch.dtype | None = None,
 ):
@@ -143,6 +150,10 @@ def triton_mm(
         assert scale_B.shape == (1, N)
         assert scale_B.is_contiguous()
 
+    if bias is not None:
+        assert bias.shape == (N,)
+        assert bias.is_contiguous()
+
     if out_dtype is None:
         if A.dtype in (torch.float32, torch.float16, torch.bfloat16):
             out_dtype = A.dtype
@@ -156,7 +167,9 @@ def triton_mm(
         acc_dtype = {torch.float32: tl.float32, torch.float16: tl.float16, torch.int32: tl.int32}[acc_dtype]
 
     C = A.new_empty(M, N, dtype=out_dtype)
-    triton_mm_kernel[_grid](A, B, C, scale_A, scale_B, M, N, K, A.stride(), B.stride(), C.stride(), ACC_DTYPE=acc_dtype)
+    triton_mm_kernel[_grid](
+        A, B, C, bias, scale_A, scale_B, M, N, K, A.stride(), B.stride(), C.stride(), ACC_DTYPE=acc_dtype
+    )
     return C
 
 
