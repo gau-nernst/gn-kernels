@@ -183,7 +183,7 @@ void sm120a_attn_mxfp8_qk_kernel(
   load_K(0);
 
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
-    float QK_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
+    float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
     // prefetch V
     // __syncthreads() here is required to make sure we finish using V_shm
@@ -210,11 +210,11 @@ void sm120a_attn_mxfp8_qk_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_FP8; mma_id_d++)
-          mma_m16n8k32_mxfp8(Q_rmem[mma_id_q][mma_id_d],
-                             K_rmem[mma_id_kv][mma_id_d],
-                             QK_rmem[mma_id_q][mma_id_kv],
-                             scale_Q_rmem[mma_id_q / 2], mma_id_d, mma_id_q % 2,
-                             scale_K_rmem[mma_id_kv / 4], mma_id_d, mma_id_kv % 4);
+          mma_mxfp8<TypeQK>(Q_rmem[mma_id_q][mma_id_d],
+                            K_rmem[mma_id_kv][mma_id_d],
+                            S_rmem[mma_id_q][mma_id_kv],
+                            scale_Q_rmem[mma_id_q / 2], mma_id_d, mma_id_q % 2,
+                            scale_K_rmem[mma_id_kv / 4], mma_id_d, mma_id_kv % 4);
 
     // prefetch K
     load_K(kv_id + 1);
@@ -223,12 +223,12 @@ void sm120a_attn_mxfp8_qk_kernel(
       // apply softmax scale
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int reg_id = 0; reg_id < 4; reg_id++)
-          QK_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
+          S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
 
       // rowmax
       float this_rowmax[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        float *regs = QK_rmem[mma_id_q][mma_id_kv];
+        float *regs = S_rmem[mma_id_q][mma_id_kv];
         if (mma_id_kv == 0) {
           this_rowmax[0] = max(regs[0], regs[1]);  // c0 and c1
           this_rowmax[1] = max(regs[2], regs[3]);  // c2 and c3
@@ -266,7 +266,7 @@ void sm120a_attn_mxfp8_qk_kernel(
       // rowsumexp
       float this_rowsumexp[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        float *regs = QK_rmem[mma_id_q][mma_id_kv];
+        float *regs = S_rmem[mma_id_q][mma_id_kv];
         regs[0] = exp2f(regs[0] - rowmax[mma_id_q][0]);  // c0
         regs[1] = exp2f(regs[1] - rowmax[mma_id_q][0]);  // c1
         regs[2] = exp2f(regs[2] - rowmax[mma_id_q][1]);  // c2

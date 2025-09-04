@@ -167,21 +167,23 @@ void mma_int8(int A[4], int B[2], int C[4]) {
                 "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 }
 
+template <typename TypeAB>
 __device__ inline
-void mma_m16n8k32_mxfp8(int A[4], int B[2], float D[4],
-                        int scale_A, short byte_id_A, short thread_id_A,
-                        int scale_B, short byte_id_B, short thread_id_B) {
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0 "
+void mma_mxfp8(int A[4], int B[2], float C[4],
+               int scale_A, short byte_id_A, short thread_id_A,
+               int scale_B, short byte_id_B, short thread_id_B) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.%20.%20.f32.ue8m0 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "
               "{%8, %9}, "
               "{%10, %11, %12, %13}, "
               "{%14}, {%15, %16}, "
               "{%17}, {%18, %19};"
-              : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+              : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]),
-                "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]),
+                "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]),
                 "r"(scale_A), "h"(byte_id_A), "h"(thread_id_A),
-                "r"(scale_B), "h"(byte_id_B), "h"(thread_id_B));
+                "r"(scale_B), "h"(byte_id_B), "h"(thread_id_B),
+                "C"(Type_str<TypeAB>::value));
 }
