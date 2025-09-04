@@ -188,7 +188,7 @@ void sm80_attn_int8_kernel(
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
     // use this as accumulator for both QK and PV
     constexpr int num_mma_n = (BLOCK_KV > DIM ? BLOCK_KV : DIM) / MMA_N;
-    int QK_rmem[WARP_Q / MMA_M][num_mma_n][4] = {};
+    int S_rmem[WARP_Q / MMA_M][num_mma_n][4] = {};
 
     // prefetch V
     // __syncthreads() here is required to make sure we finish using V_shm
@@ -220,9 +220,9 @@ void sm80_attn_int8_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++)
-          mma_m16n8k32_s8s8(Q_rmem[mma_id_q][mma_id_d],
-                            K_rmem[mma_id_kv][mma_id_d],
-                            QK_rmem[mma_id_q][mma_id_kv]);
+          mma_m16n8k32_int8<char, char>(Q_rmem[mma_id_q][mma_id_d],
+                                        K_rmem[mma_id_kv][mma_id_d],
+                                        S_rmem[mma_id_q][mma_id_kv]);
 
     // prefetch K
     load_K(kv_id + 1);
@@ -231,7 +231,7 @@ void sm80_attn_int8_kernel(
       // rowmax
       float this_rowmax[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        int *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = S_rmem[mma_id_q][mma_id_kv];
 
         float c0 = (float)regs[0] * scale_K_rmem[mma_id_kv][0];
         float c1 = (float)regs[1] * scale_K_rmem[mma_id_kv][1];
@@ -278,7 +278,7 @@ void sm80_attn_int8_kernel(
       // rowsumexp
       float this_rowsumexp[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv += 2) {
-        int *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = S_rmem[mma_id_q][mma_id_kv];
 
         // recompute
         // TODO: check if we can avoid recompute (but don't use too much registers)
@@ -348,7 +348,7 @@ void sm80_attn_int8_kernel(
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv += 2) {
         int addr = V_smem_thread
-                      + (mma_id_d * MMA_N) * BLOCK_KV * sizeof(Type);  // row
+                 + (mma_id_d * MMA_N) * BLOCK_KV * sizeof(Type);  // row
         addr ^= (mma_id_kv * MMA_K) * sizeof(Type);  // col
         ldmatrix<4>(V_rmem[mma_id_d][mma_id_kv], addr);
       }
@@ -364,22 +364,22 @@ void sm80_attn_int8_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int reg_id = 0; reg_id < 4; reg_id++)
-          QK_rmem[mma_id_q][mma_id_d][reg_id] = 0;
+          S_rmem[mma_id_q][mma_id_d][reg_id] = 0;
 
-    // MMA O = P @ V [BLOCK_Q, DIM]
+    // MMA O += P @ V [BLOCK_Q, DIM]
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
-          mma_m16n8k32_u8s8(P_rmem[mma_id_q][mma_id_kv],
-                            V_rmem[mma_id_d][mma_id_kv],
-                            QK_rmem[mma_id_q][mma_id_d]);
+          mma_m16n8k32_int8<unsigned char, char>(P_rmem[mma_id_q][mma_id_kv],
+                                                 V_rmem[mma_id_d][mma_id_kv],
+                                                 S_rmem[mma_id_q][mma_id_d]);
 
     // accumulate to master O_rmem
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int reg_id = 0; reg_id < 4; reg_id++)
-          O_rmem[mma_id_q][mma_id_d][reg_id] += (float)QK_rmem[mma_id_q][mma_id_d][reg_id]
-                                                * scale_V_rmem[mma_id_d][reg_id % 2];
+          O_rmem[mma_id_q][mma_id_d][reg_id] += (float)S_rmem[mma_id_q][mma_id_d][reg_id]
+                                              * scale_V_rmem[mma_id_d][reg_id % 2];
   }
 
   // write to O

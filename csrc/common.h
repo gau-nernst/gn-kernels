@@ -98,43 +98,37 @@ void ldmatrix_trans(int *regs, int addr) {
                 : "r"(addr));
 }
 
+template <typename T>
+struct PTX_str;
+template<> struct PTX_str<char> { static constexpr const char value[] = ".s8"; };
+template<> struct PTX_str<unsigned char> { static constexpr const char value[] = ".u8"; };
+
 __device__ inline
-void mma_m16n8k16_bf16(int A[4], int B[2], float D[4]) {
+void mma_m16n8k16_bf16(int A[4], int B[2], float C[4]) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "
               "{%8, %9}, "
               "{%10, %11, %12, %13};"
-              : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+              : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]),
-                "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
+                "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
 }
 
+template <typename TypeA, typename TypeB>
 __device__ inline
-void mma_m16n8k32_s8s8(int A[4], int B[2], int D[4]) {
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 "
+void mma_m16n8k32_int8(int A[4], int B[2], int C[4]) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32%14%15.s32 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "
               "{%8, %9}, "
               "{%10, %11, %12, %13};"
-              : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+              : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]),
-                "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]));
-}
-
-__device__ inline
-void mma_m16n8k32_u8s8(int A[4], int B[2], int D[4]) {
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
-              "{%0, %1, %2, %3}, "
-              "{%4, %5, %6, %7}, "
-              "{%8, %9}, "
-              "{%10, %11, %12, %13};"
-              : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
-              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-                "r"(B[0]), "r"(B[1]),
-                "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]));
+                "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3])
+                "C"(PTX_str<TypeA>::value), "C"(PTX_str<TypeB>::value));
 }
 
 __device__ inline

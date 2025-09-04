@@ -185,7 +185,7 @@ void sm80_attn_int8_qk_kernel(
   load_K(0);
 
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
-    int QK_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
+    int S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
     // prefetch V
     // __syncthreads() is required to make sure we finish using shared memory
@@ -217,9 +217,9 @@ void sm80_attn_int8_qk_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_INT8; mma_id_d++)
-          mma_m16n8k32_s8s8(Q_rmem[mma_id_q][mma_id_d],
-                            K_rmem[mma_id_kv][mma_id_d],
-                            QK_rmem[mma_id_q][mma_id_kv]);
+          mma_m16n8k32_int8<char, char>(Q_rmem[mma_id_q][mma_id_d],
+                                        K_rmem[mma_id_kv][mma_id_d],
+                                        S_rmem[mma_id_q][mma_id_kv]);
 
     // prefetch K
     load_K(kv_id + 1);
@@ -228,7 +228,7 @@ void sm80_attn_int8_qk_kernel(
       // rowmax
       float this_rowmax[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        int *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = S_rmem[mma_id_q][mma_id_kv];
 
         float c0 = (float)regs[0] * scale_K_rmem[mma_id_kv][0];
         float c1 = (float)regs[1] * scale_K_rmem[mma_id_kv][1];
@@ -275,7 +275,7 @@ void sm80_attn_int8_qk_kernel(
       // rowsumexp
       float this_rowsumexp[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        int *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = S_rmem[mma_id_q][mma_id_kv];
 
         // recompute
         // TODO: check if we can avoid recompute (but don't use too much registers)
