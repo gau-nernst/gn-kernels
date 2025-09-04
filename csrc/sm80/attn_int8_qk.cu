@@ -1,4 +1,5 @@
 #include "../common.h"
+#include "../host_utils.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -65,17 +66,17 @@ void sm80_attn_int8_qk_kernel(
 
   // we overlap (Q_smem + scale_Q_smem) with (K_smem + scale_K_smem + V_smem)
   // since we only need to load (Q_smem + scale_Q_smem) once
-  extern __shared__ uint8_t smem[];
-  const uint32_t Q_smem = __cvta_generic_to_shared(smem);
-  const uint32_t scale_Q_smem = Q_smem + BLOCK_Q * DIM * sizeof(TypeQK);
+  extern __shared__ char smem[];
+  const int Q_smem = __cvta_generic_to_shared(smem);
+  const int scale_Q_smem = Q_smem + BLOCK_Q * DIM * sizeof(TypeQK);
 
   // double buffer for K, V, and scale_K
-  const uint32_t K_smem = Q_smem;
-  const uint32_t V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeQK);
-  const uint32_t scale_K_smem = V_smem + BLOCK_KV * DIM * sizeof(TypeV);
+  const int K_smem = Q_smem;
+  const int V_smem = K_smem + 2 * BLOCK_KV * DIM * sizeof(TypeQK);
+  const int scale_K_smem = V_smem + BLOCK_KV * DIM * sizeof(TypeV);
 
   // pre-compute address and swizzling for ldmatrix
-  uint32_t Q_smem_thread, K_smem_thread, V_smem_thread;
+  int Q_smem_thread, K_smem_thread, V_smem_thread;
   {
     // A tile
     const int row = warp_id * WARP_Q + (lane_id % 16);
@@ -96,14 +97,14 @@ void sm80_attn_int8_qk_kernel(
   }
 
   // set up registers
-  uint32_t Q_rmem[WARP_Q / MMA_M][DIM / MMA_K_INT8][4];
-  uint32_t K_rmem[BLOCK_KV / MMA_N][DIM / MMA_K_INT8][2];
+  int Q_rmem[WARP_Q / MMA_M][DIM / MMA_K_INT8][4];
+  int K_rmem[BLOCK_KV / MMA_N][DIM / MMA_K_INT8][2];
   float scale_Q_rmem[WARP_Q / MMA_M][2];
   float scale_K_rmem[BLOCK_KV / MMA_N][2];
 
   // let compiler decide register reuse?
-  uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K_BF16][4];
-  uint32_t V_rmem[BLOCK_KV / MMA_K_BF16][DIM / MMA_N][2];
+  int P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K_BF16][4];
+  int V_rmem[BLOCK_KV / MMA_K_BF16][DIM / MMA_N][2];
 
   // we use the same registers for O_regs and PV_regs
   // rescale O_regs once we obtain new rowmax, then accumulate to O_regs
@@ -134,18 +135,18 @@ void sm80_attn_int8_qk_kernel(
   // shared -> registers
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_INT8; mma_id_d++) {
-      uint32_t addr = Q_smem_thread;
+      int addr = Q_smem_thread;
       addr += mma_id_q * MMA_M * DIM * sizeof(TypeQK);  // row
       addr ^= mma_id_d * MMA_K_INT8 * sizeof(TypeQK);  // col
       ldmatrix<4>(Q_rmem[mma_id_q][mma_id_d], addr);
     }
 
-    const uint32_t addr = scale_Q_smem
-                        + warp_id * WARP_Q * sizeof(TypeScale)
-                        + mma_id_q * MMA_M * sizeof(TypeScale)
-                        + (lane_id / 4) * sizeof(TypeScale);
+    const int addr = scale_Q_smem
+                   + warp_id * WARP_Q * sizeof(TypeScale)
+                   + mma_id_q * MMA_M * sizeof(TypeScale)
+                   + (lane_id / 4) * sizeof(TypeScale);
     asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_Q_rmem[mma_id_q][0]) : "r"(addr));
-    asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_Q_rmem[mma_id_q][1]) : "r"(addr + (uint32_t)(8 * sizeof(TypeScale))));
+    asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_Q_rmem[mma_id_q][1]) : "r"(addr + (int)(8 * sizeof(TypeScale))));
 
     // fuse softmax scale into scale_Q
     scale_Q_rmem[mma_id_q][0] *= softmax_scale;
@@ -161,12 +162,12 @@ void sm80_attn_int8_qk_kernel(
   auto load_K = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
       {
-        const uint32_t dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK);
+        const int dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK);
         global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, K_gmem, K_stride.y, tid);
         K_gmem += BLOCK_KV * K_stride.y;
       }
       {
-        const uint32_t dst = scale_K_smem + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale);
+        const int dst = scale_K_smem + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale);
         constexpr int width = 16 / sizeof(TypeScale);  // no swizzling
         global_to_shared_swizzle<BLOCK_KV / width, width, TB_SIZE>(dst, scale_K_gmem, width, tid);
         scale_K_gmem += BLOCK_KV;
@@ -184,7 +185,7 @@ void sm80_attn_int8_qk_kernel(
   load_K(0);
 
   for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
-    int32_t QK_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
+    int QK_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};
 
     // prefetch V
     // __syncthreads() is required to make sure we finish using shared memory
@@ -197,19 +198,19 @@ void sm80_attn_int8_qk_kernel(
     __syncthreads();
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_INT8; mma_id_d += 2) {
-        uint32_t addr = K_smem_thread
-                      + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK)
-                      + mma_id_kv * MMA_N * DIM * sizeof(TypeQK);  // row
+        int addr = K_smem_thread
+                 + (kv_id % 2) * (BLOCK_KV * DIM) * sizeof(TypeQK)
+                 + mma_id_kv * MMA_N * DIM * sizeof(TypeQK);  // row
         addr ^= mma_id_d * MMA_K_INT8 * sizeof(TypeQK);  // col
         ldmatrix<4>(K_rmem[mma_id_kv][mma_id_d], addr);
       }
 
-      const uint32_t addr = scale_K_smem
-                          + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale)
-                          + (mma_id_kv * MMA_N) * sizeof(TypeScale)
-                          + (lane_id % 4) * 2 * sizeof(TypeScale);
+      const int addr = scale_K_smem
+                     + (kv_id % 2) * BLOCK_KV * sizeof(TypeScale)
+                     + (mma_id_kv * MMA_N) * sizeof(TypeScale)
+                     + (lane_id % 4) * 2 * sizeof(TypeScale);
       asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_K_rmem[mma_id_kv][0]) : "r"(addr));
-      asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_K_rmem[mma_id_kv][1]) : "r"(addr + (uint32_t)sizeof(TypeScale)));
+      asm volatile("ld.shared.f32 %0, [%1];" : "=f"(scale_K_rmem[mma_id_kv][1]) : "r"(addr + (int)sizeof(TypeScale)));
     }
 
     // MMA S = Q @ K.T [BLOCK_Q, BLOCK_KV]
@@ -227,7 +228,7 @@ void sm80_attn_int8_qk_kernel(
       // rowmax
       float this_rowmax[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        int32_t *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = QK_rmem[mma_id_q][mma_id_kv];
 
         float c0 = (float)regs[0] * scale_K_rmem[mma_id_kv][0];
         float c1 = (float)regs[1] * scale_K_rmem[mma_id_kv][1];
@@ -274,7 +275,7 @@ void sm80_attn_int8_qk_kernel(
       // rowsumexp
       float this_rowsumexp[2];
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        int32_t *regs = QK_rmem[mma_id_q][mma_id_kv];
+        int *regs = QK_rmem[mma_id_q][mma_id_kv];
 
         // recompute
         // TODO: check if we can avoid recompute (but don't use too much registers)
@@ -319,8 +320,8 @@ void sm80_attn_int8_qk_kernel(
     __syncthreads();
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K_BF16; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d += 2) {
-        uint32_t addr = V_smem_thread
-                      + mma_id_kv * MMA_K_BF16 * DIM * sizeof(TypeV);  // row
+        int addr = V_smem_thread
+                 + mma_id_kv * MMA_K_BF16 * DIM * sizeof(TypeV);  // row
         addr ^= mma_id_d * MMA_N * sizeof(TypeV);  // col
         ldmatrix_trans<4>(V_rmem[mma_id_kv][mma_id_d], addr);
       }
