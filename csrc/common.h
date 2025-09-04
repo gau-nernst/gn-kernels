@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
 inline constexpr int WARP_SIZE = 32;
 
 __device__ __host__ constexpr
@@ -98,28 +102,60 @@ void ldmatrix_trans(int *regs, int addr) {
                 : "r"(addr));
 }
 
+// https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html#constraints
 template <typename T>
-struct PTX_str;
-template<> struct PTX_str<char> { static constexpr const char value[] = ".s8"; };
-template<> struct PTX_str<unsigned char> { static constexpr const char value[] = ".u8"; };
+struct Type_str;
+template<> struct Type_str<float> { static constexpr const char value[] = "f32"; };
+template<> struct Type_str<half> { static constexpr const char value[] = "f16"; };
+template<> struct Type_str<nv_bfloat16> { static constexpr const char value[] = "bf16"; };
+template<> struct Type_str<__nv_fp8_e4m3> { static constexpr const char value[] = "e4m3"; };
+template<> struct Type_str<__nv_fp8_e5m2> { static constexpr const char value[] = "e5m2"; };
+template<> struct Type_str<char> { static constexpr const char value[] = "s8"; };
+template<> struct Type_str<unsigned char> { static constexpr const char value[] = "u8"; };
 
+template <int element_size>
+struct MMA_shape_str;
+template<> struct MMA_shape_str<2> { static constexpr const char value[] = "m16n8k16"; };
+template<> struct MMA_shape_str<1> { static constexpr const char value[] = "m16n8k32"; };
+
+template <typename TypeAB, typename T>
 __device__ inline
-void mma_m16n8k16_bf16(int A[4], int B[2], float C[4]) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-              "{%0, %1, %2, %3}, "
-              "{%4, %5, %6, %7}, "
-              "{%8, %9}, "
-              "{%10, %11, %12, %13};"
-              : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-                "r"(B[0]), "r"(B[1]),
-                "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+void mma_fp(int A[4], int B[2], T *C) {
+  static_assert(std::is_same_v<T, float> || std::is_same_v<T, int>);
+
+  using shape = MMA_shape_str<sizeof(TypeAB)>;
+  using abtype = Type_str<TypeAB>;
+
+  if constexpr (std::is_same_v<T, float>)
+    asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%15.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]),
+                  "C"(shape::value), "C"(abtype::value));
+
+  // assume if type of C is int, the user wants FP16 accumulation
+  else if constexpr (std::is_same_v<T, int>)
+    asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%11.f16 "
+                "{%0, %1}, "
+                "{%2, %3, %4, %5}, "
+                "{%6, %7}, "
+                "{%8, %9};"
+                : "=r"(C[0]), "=r"(C[1])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(C[0]), "r"(C[1]), "r"(C[2]), "f"(C[3]),
+                  "C"(shape::value), "C"(abtype::value));
 }
 
-template <typename TypeA, typename TypeB>
+template <typename atype, typename btype>
 __device__ inline
-void mma_m16n8k32_int8(int A[4], int B[2], int C[4]) {
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32%14%15.s32 "
+void mma_int8(int A[4], int B[2], int C[4]) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%14.%15.s32 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "
               "{%8, %9}, "
@@ -127,8 +163,8 @@ void mma_m16n8k32_int8(int A[4], int B[2], int C[4]) {
               : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]),
-                "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3])
-                "C"(PTX_str<TypeA>::value), "C"(PTX_str<TypeB>::value));
+                "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]),
+                "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 }
 
 __device__ inline
