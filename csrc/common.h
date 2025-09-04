@@ -148,7 +148,7 @@ void mma_fp(int A[4], int B[2], T *C) {
                 : "=r"(C[0]), "=r"(C[1])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(C[0]), "r"(C[1]), "r"(C[2]), "f"(C[3]),
+                  "r"(C[0]), "r"(C[1]),
                   "C"(shape::value), "C"(abtype::value));
 }
 
