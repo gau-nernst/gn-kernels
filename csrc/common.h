@@ -5,6 +5,8 @@
 #include <cuda_fp8.h>
 
 inline constexpr int WARP_SIZE = 32;
+inline constexpr int MMA_M = 16;
+inline constexpr int MMA_N = 8;
 
 __device__ __host__ constexpr
 int cdiv(int a, int b) { return (a + b - 1) / b; }

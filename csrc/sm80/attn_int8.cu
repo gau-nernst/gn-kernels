@@ -47,8 +47,6 @@ void sm80_attn_int8_kernel(
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
 
   // m16n8k32
-  constexpr int MMA_M = 16;
-  constexpr int MMA_N = 8;
   constexpr int MMA_K = 32;
 
   Q += (bs_id * num_q_blocks + q_block_id) * BLOCK_Q * DIM;

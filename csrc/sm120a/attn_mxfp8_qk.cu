@@ -71,8 +71,6 @@ void sm120a_attn_mxfp8_qk_kernel(
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
 
   // m16n8k16 BF16 and m16n8k32 FP8
-  constexpr int MMA_M = 16;
-  constexpr int MMA_N = 8;
   constexpr int MMA_K_BF16 = 16;
   constexpr int MMA_K_FP8 = 32;
 
