@@ -7,6 +7,7 @@
 constexpr int BLOCK_M = 128;
 constexpr int BLOCK_N = 128;
 constexpr int BLOCK_K = 64;
+constexpr int GROUP_M = 8;
 
 constexpr int NUM_WARP_M = 2;
 constexpr int NUM_WARP_N = 2;

@@ -28,6 +28,7 @@ HEADER_TEMPLATE = """
 constexpr int BLOCK_M = {};
 constexpr int BLOCK_N = {};
 constexpr int BLOCK_K = {};
+constexpr int GROUP_M = {};
 
 constexpr int NUM_WARP_M = {};
 constexpr int NUM_WARP_N = {};
@@ -50,6 +51,7 @@ class MatmulKernel:
     out_dtype: torch.dtype = torch.bfloat16
     acc_dtype: torch.dtype = torch.float32
     block_mnk: tuple[int, int, int] = (128, 128, 64)
+    group_m: int = 8
     warp_mn: tuple[int, int] = (2, 2)
     num_stages: int = 1
 
@@ -68,6 +70,7 @@ class MatmulKernel:
 
         header = HEADER_TEMPLATE.format(
             *self.block_mnk,
+            self.group_m,
             *self.warp_mn,
             self.num_stages,
             _TYPE_MAP[self.in_dtype],

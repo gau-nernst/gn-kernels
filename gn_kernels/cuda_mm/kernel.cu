@@ -22,11 +22,24 @@ void matmul_kernel(
   const int warp_id_m = warp_id / NUM_WARP_N;
   const int warp_id_n = warp_id % NUM_WARP_N;
 
-  // TODO: threadblock swizzling
   const int bid = blockIdx.x;
+  const int grid_m = cdiv(M, BLOCK_M);
   const int grid_n = cdiv(N, BLOCK_N);
-  const int bid_m = bid / grid_n;
-  const int bid_n = bid % grid_n;
+
+  int bid_m, bid_n;
+  if constexpr (GROUP_M == 1) {
+    bid_m = bid / grid_n;
+    bid_n = bid % grid_n;
+  } else {
+    // threadblock swizzling, from triton
+    // improve L2 reuse when M is large.
+    const int group_size = GROUP_M * grid_n;
+    const int group_id = bid / group_size;
+    const int first_bid_m = group_id * GROUP_M;
+    const int group_size_m = min(grid_m - first_bid_m, GROUP_M);
+    bid_m = first_bid_m + ((bid % group_size) % group_size_m);
+    bid_n = (bid % group_size) / group_size_m;
+  }
 
   const int offset_m = bid_m * BLOCK_M;
   const int offset_n = bid_n * BLOCK_N;
