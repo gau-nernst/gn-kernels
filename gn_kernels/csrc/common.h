@@ -155,9 +155,10 @@ void mma_fp(int A[4], int B[2], T *C) {
                   "C"(shape::value), "C"(abtype::value));
 }
 
-template <typename atype, typename btype>
+template <typename atype, typename btype, typename ctype>
 __device__ inline
-void mma_int8(int A[4], int B[2], int C[4]) {
+void mma_int8(int A[4], int B[2], ctype C[4]) {
+  static_assert(cuda::std::is_same_v<ctype, int>);
   asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%14.%15.s32 "
               "{%0, %1, %2, %3}, "
               "{%4, %5, %6, %7}, "

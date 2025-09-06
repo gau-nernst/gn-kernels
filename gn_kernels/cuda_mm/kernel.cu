@@ -103,13 +103,18 @@ void matmul_kernel(
         ldmatrix<4>(B_rmem[mma_id_n][mma_id_k], addr);
       }
 
-    // mma
+    // MMA
     for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
       for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
         for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++)
-          mma_fp<TypeAB>(A_rmem[mma_id_m][mma_id_k],
-                         B_rmem[mma_id_n][mma_id_k],
-                         acc[mma_id_m][mma_id_n]);
+          if constexpr (cuda::std::is_same_v<TypeAB, char>)
+            mma_int8<TypeAB, TypeAB>(A_rmem[mma_id_m][mma_id_k],
+                                     B_rmem[mma_id_n][mma_id_k],
+                                     acc[mma_id_m][mma_id_n]);
+          else
+            mma_fp<TypeAB>(A_rmem[mma_id_m][mma_id_k],
+                           B_rmem[mma_id_n][mma_id_k],
+                           acc[mma_id_m][mma_id_n]);
   }
 
   // write results to gmem. wait for the last MMA to finish.

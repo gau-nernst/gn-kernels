@@ -10,9 +10,11 @@ _TYPE_MAP = {
     torch.float32: "float",
     torch.float16: "half",
     torch.bfloat16: "nv_bfloat16",
+    torch.float8_e4m3fn: "__nv_fp8_e4m3",
+    torch.float8_e5m2: "__nv_fp8_e5m2",
+    torch.int32: "int",
     torch.int8: "char",
     torch.uint8: "unsigned char",
-    torch.int32: "int",
 }
 
 CURRENT_DIR = Path(__file__).parent
