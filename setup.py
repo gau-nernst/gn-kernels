@@ -15,7 +15,7 @@ def get_extension(arch: str):
 
     return CUDAExtension(
         name=f"{NAME}.sm{arch}",
-        sources=[str(x) for x in CURRENT_DIR.glob(f"csrc/sm{arch}/*.cu")],
+        sources=[str(x) for x in CURRENT_DIR.glob(f"gn_kernels/csrc/sm{arch}/*.cu")],
         py_limited_api=True,
         extra_compile_args=dict(
             nvcc=[

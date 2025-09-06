@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda/std/type_traits>  // for std::is_same_v
 
 inline constexpr int WARP_SIZE = 32;
 inline constexpr int MMA_M = 16;
@@ -123,12 +124,12 @@ template<> struct MMA_shape_str<1> { static constexpr const char value[] = "m16n
 template <typename TypeAB, typename T>
 __device__ inline
 void mma_fp(int A[4], int B[2], T *C) {
-  static_assert(std::is_same_v<T, float> || std::is_same_v<T, int>);
+  static_assert(cuda::std::is_same_v<T, float> || cuda::std::is_same_v<T, int>);
 
   using shape = MMA_shape_str<sizeof(TypeAB)>;
   using abtype = Type_str<TypeAB>;
 
-  if constexpr (std::is_same_v<T, float>)
+  if constexpr (cuda::std::is_same_v<T, float>)
     asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%15.f32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
@@ -141,7 +142,7 @@ void mma_fp(int A[4], int B[2], T *C) {
                   "C"(shape::value), "C"(abtype::value));
 
   // assume if type of C is int, the user wants FP16 accumulation
-  else if constexpr (std::is_same_v<T, int>)
+  else if constexpr (cuda::std::is_same_v<T, int>)
     asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%11.f16 "
                 "{%0, %1}, "
                 "{%2, %3, %4, %5}, "
