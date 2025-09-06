@@ -45,7 +45,7 @@ void matmul_kernel(
   // set up register memory
   int A_rmem[WARP_M / MMA_M][BLOCK_K / 16][4];
   int B_rmem[WARP_N / MMA_N][BLOCK_K / 16][2];
-  TypeAcc acc[WARP_M / MMA_M][WARP_N / MMA_N][4] = {};
+  int C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][sizeof(TypeAcc)] = {};  // 4 for FP32/INT32, 2 for FP16
 
   // pre-compute ldmatrix address and swizzling
   int A_smem_thread, B_smem_thread;
@@ -107,14 +107,9 @@ void matmul_kernel(
     for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
       for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
         for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++)
-          if constexpr (cuda::std::is_same_v<TypeAB, char>)
-            mma_int8<TypeAB, TypeAB>(A_rmem[mma_id_m][mma_id_k],
-                                     B_rmem[mma_id_n][mma_id_k],
-                                     acc[mma_id_m][mma_id_n]);
-          else
-            mma_fp<TypeAB>(A_rmem[mma_id_m][mma_id_k],
-                           B_rmem[mma_id_n][mma_id_k],
-                           acc[mma_id_m][mma_id_n]);
+          mma<TypeAB, TypeAB, TypeAcc>(A_rmem[mma_id_m][mma_id_k],
+                                       B_rmem[mma_id_n][mma_id_k],
+                                       C_rmem[mma_id_m][mma_id_n]);
   }
 
   // write results to gmem. wait for the last MMA to finish.
@@ -123,22 +118,27 @@ void matmul_kernel(
     for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++) {
       const int row = mma_id_m * MMA_M + (lane_id / 4);
       const int col = mma_id_n * MMA_N + (lane_id % 4) * 2;
-      TypeAcc *this_acc = acc[mma_id_m][mma_id_n];
 
-      // TODO: maybe change this to some PTX
+      const int *acc = C_rmem[mma_id_m][mma_id_n];
+
       if constexpr (cuda::std::is_same_v<TypeAcc, TypeC>) {
-        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 0) * N + (col + 0)] = this_acc[0];
-        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 0) * N + (col + 1)] = this_acc[1];
-        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 8) * N + (col + 0)] = this_acc[2];
-        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 8) * N + (col + 1)] = this_acc[3];
+        // no conversion needed
+        // either 4-byte (FP32/INT32) or 2-byte (FP16) per elem
+        // which we pack 2 elems into 8-byte or 4-byte respectively
+        using write_type = cuda::std::conditional_t<sizeof(TypeC) == 4, long, int>;
+        reinterpret_cast<write_type *>(C_gmem + (row + 0) * N + col)[0] = reinterpret_cast<const write_type *>(acc)[0];
+        reinterpret_cast<write_type *>(C_gmem + (row + 8) * N + col)[0] = reinterpret_cast<const write_type *>(acc)[1];
       }
       else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, nv_bfloat16>) {
-        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 0) * N + col)[0] = __float22bfloat162_rn({this_acc[0], this_acc[1]});
-        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 8) * N + col)[0] = __float22bfloat162_rn({this_acc[2], this_acc[3]});
+        const float *acc_fp32 = reinterpret_cast<const float *>(acc);
+        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 0) * N + col)[0] = __float22bfloat162_rn({acc_fp32[0], acc_fp32[1]});
+        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 8) * N + col)[0] = __float22bfloat162_rn({acc_fp32[2], acc_fp32[3]});
       }
       else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, half>) {
-        reinterpret_cast<half2 *>(C_gmem + (row + 0) * N + col)[0] = __float22half2_rn({this_acc[0], this_acc[1]});
-        reinterpret_cast<half2 *>(C_gmem + (row + 8) * N + col)[0] = __float22half2_rn({this_acc[2], this_acc[3]});
+        const float *acc_fp32 = reinterpret_cast<const float *>(acc);
+        reinterpret_cast<half2 *>(C_gmem + (row + 0) * N + col)[0] = __float22half2_rn({acc_fp32[0], acc_fp32[1]});
+        reinterpret_cast<half2 *>(C_gmem + (row + 8) * N + col)[0] = __float22half2_rn({acc_fp32[2], acc_fp32[3]});
       }
+      // don't handle other cases yet...
     }
 }

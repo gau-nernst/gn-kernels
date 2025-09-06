@@ -113,7 +113,8 @@ template<> struct Type_str<half> { static constexpr const char value[] = "f16"; 
 template<> struct Type_str<nv_bfloat16> { static constexpr const char value[] = "bf16"; };
 template<> struct Type_str<__nv_fp8_e4m3> { static constexpr const char value[] = "e4m3"; };
 template<> struct Type_str<__nv_fp8_e5m2> { static constexpr const char value[] = "e5m2"; };
-template<> struct Type_str<char> { static constexpr const char value[] = "s8"; };
+// NOTE: according to C/C++ spec, sign-ness of char is implementation-defined
+template<> struct Type_str<signed char> { static constexpr const char value[] = "s8"; };
 template<> struct Type_str<unsigned char> { static constexpr const char value[] = "u8"; };
 
 template <int element_size>
@@ -121,54 +122,56 @@ struct MMA_shape_str;
 template<> struct MMA_shape_str<2> { static constexpr const char value[] = "m16n8k16"; };
 template<> struct MMA_shape_str<1> { static constexpr const char value[] = "m16n8k32"; };
 
-template <typename TypeAB, typename T>
+template <typename atype, typename btype, typename ctype>
 __device__ inline
-void mma_fp(int A[4], int B[2], T *C) {
-  static_assert(cuda::std::is_same_v<T, float> || cuda::std::is_same_v<T, int>);
+void mma(int A[4], int B[2], void *C) {
+  static_assert(cuda::std::is_same_v<ctype, float>
+              || cuda::std::is_same_v<ctype, half>
+              || cuda::std::is_same_v<ctype, int>);
 
-  using shape = MMA_shape_str<sizeof(TypeAB)>;
-  using abtype = Type_str<TypeAB>;
+  // use void * for input so that we can pass either float or int
+  int *D = reinterpret_cast<int *>(C);
 
-  if constexpr (cuda::std::is_same_v<T, float>)
-    asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%15.f32 "
+  // m16n8k16 for FP16/BF16
+  // m16n8k32 for FP8/INT8
+  using shape = MMA_shape_str<sizeof(atype)>;
+
+  if constexpr (cuda::std::is_same_v<ctype, float>)
+    asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%16.f32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
                 "{%10, %11, %12, %13};"
-                : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]),
-                  "C"(shape::value), "C"(abtype::value));
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
-  // assume if type of C is int, the user wants FP16 accumulation
-  else if constexpr (cuda::std::is_same_v<T, int>)
-    asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%11.f16 "
+  else if constexpr (cuda::std::is_same_v<ctype, half>)
+    asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%12.f16 "
                 "{%0, %1}, "
                 "{%2, %3, %4, %5}, "
                 "{%6, %7}, "
                 "{%8, %9};"
-                : "=r"(C[0]), "=r"(C[1])
+                : "=r"(D[0]), "=r"(D[1])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(C[0]), "r"(C[1]),
-                  "C"(shape::value), "C"(abtype::value));
-}
+                  "r"(D[0]), "r"(D[1]),
+                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
-template <typename atype, typename btype, typename ctype>
-__device__ inline
-void mma_int8(int A[4], int B[2], ctype C[4]) {
-  static_assert(cuda::std::is_same_v<ctype, int>);
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%14.%15.s32 "
-              "{%0, %1, %2, %3}, "
-              "{%4, %5, %6, %7}, "
-              "{%8, %9}, "
-              "{%10, %11, %12, %13};"
-              : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-              : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-                "r"(B[0]), "r"(B[1]),
-                "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]),
-                "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
+  // TODO: maybe we can include .satfinite in the 1st case as well?
+  else if constexpr (cuda::std::is_same_v<ctype, int>)
+    asm volatile("mma.sync.aligned.%14.row.col.satfinite.s32.%15.%16.s32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 }
 
 template <typename TypeAB>

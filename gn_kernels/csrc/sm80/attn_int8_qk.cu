@@ -215,9 +215,9 @@ void sm80_attn_int8_qk_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
         for (int mma_id_d = 0; mma_id_d < DIM / MMA_K_INT8; mma_id_d++)
-          mma_int8<char, char>(Q_rmem[mma_id_q][mma_id_d],
-                               K_rmem[mma_id_kv][mma_id_d],
-                               S_rmem[mma_id_q][mma_id_kv]);
+          mma<int8_t, int8_t, int>(Q_rmem[mma_id_q][mma_id_d],
+                                   K_rmem[mma_id_kv][mma_id_d],
+                                   S_rmem[mma_id_q][mma_id_kv]);
 
     // prefetch K
     load_K(kv_id + 1);
@@ -328,9 +328,9 @@ void sm80_attn_int8_qk_kernel(
     for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
       for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++)
         for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K_BF16; mma_id_kv++)
-          mma_fp<nv_bfloat16>(P_rmem[mma_id_q][mma_id_kv],
-                              V_rmem[mma_id_kv][mma_id_d],
-                              O_rmem[mma_id_q][mma_id_d]);
+          mma<nv_bfloat16, nv_bfloat16, float>(P_rmem[mma_id_q][mma_id_kv],
+                                               V_rmem[mma_id_kv][mma_id_d],
+                                               O_rmem[mma_id_q][mma_id_d]);
   }
 
   // write to O
