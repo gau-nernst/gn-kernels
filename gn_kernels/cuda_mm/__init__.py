@@ -48,7 +48,7 @@ def cdiv(a, b):
 class MatmulKernel:
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = torch.bfloat16
-    acc_dtype: torch.dtype = torch.float
+    acc_dtype: torch.dtype = torch.float32
     block_mnk: tuple[int, int, int] = (128, 128, 64)
     warp_mn: tuple[int, int] = (2, 2)
     num_stages: int = 1
@@ -96,7 +96,7 @@ class MatmulKernel:
 
         M, K = A.shape
         _, N = B.shape
-        C = A.new_zeros(M, N, dtype=self.out_dtype)
+        C = A.new_empty(M, N, dtype=self.out_dtype)
 
         grid = cdiv(M, self.block_mnk[0]) * cdiv(N, self.block_mnk[1])
         self.kernel((grid, 1, 1), self.tb_size, (A, B, C, M, N, K), self.smem_size)

@@ -51,13 +51,13 @@ void matmul_kernel(
   int A_smem_thread, B_smem_thread;
   {
     const int m = (warp_id_m * WARP_M) + (lane_id % 16);
-    const int k = (lane_id / 16) * 8;
-    A_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(A_smem + (m * BLOCK_K + k) * sizeof(TypeAB));
+    const int k = (lane_id / 16) * 16;  // 16-byte
+    A_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(A_smem + (m * BLOCK_K * sizeof(TypeAB)) + k);
   }
   {
     const int n = (warp_id_n * WARP_N) + (lane_id % 8);
-    const int k = (lane_id / 8) * 8;
-    B_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(B_smem + (n * BLOCK_K + k) * sizeof(TypeAB));
+    const int k = (lane_id / 8) * 16;
+    B_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(B_smem + (n * BLOCK_K * sizeof(TypeAB)) + k);
   }
 
   const int num_k_iters = cdiv(K, BLOCK_K);
@@ -123,17 +123,22 @@ void matmul_kernel(
     for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++) {
       const int row = mma_id_m * MMA_M + (lane_id / 4);
       const int col = mma_id_n * MMA_N + (lane_id % 4) * 2;
-      TypeC *this_C_gmem = C_gmem + row * N + col;
       TypeAcc *this_acc = acc[mma_id_m][mma_id_n];
 
       // TODO: maybe change this to some PTX
-      if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, nv_bfloat16>) {
-        reinterpret_cast<nv_bfloat162 *>(this_C_gmem)[0]         = __float22bfloat162_rn({this_acc[0], this_acc[1]});
-        reinterpret_cast<nv_bfloat162 *>(this_C_gmem + 8 * N)[0] = __float22bfloat162_rn({this_acc[2], this_acc[3]});
+      if constexpr (cuda::std::is_same_v<TypeAcc, TypeC>) {
+        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 0) * N + (col + 0)] = this_acc[0];
+        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 0) * N + (col + 1)] = this_acc[1];
+        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 8) * N + (col + 0)] = this_acc[2];
+        reinterpret_cast<TypeAcc *>(C_gmem)[(row + 8) * N + (col + 1)] = this_acc[3];
+      }
+      else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, nv_bfloat16>) {
+        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 0) * N + col)[0] = __float22bfloat162_rn({this_acc[0], this_acc[1]});
+        reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 8) * N + col)[0] = __float22bfloat162_rn({this_acc[2], this_acc[3]});
       }
       else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, half>) {
-        reinterpret_cast<half2 *>(this_C_gmem)[0]         = __float22half2_rn({this_acc[0], this_acc[1]});
-        reinterpret_cast<half2 *>(this_C_gmem + 8 * N)[0] = __float22half2_rn({this_acc[2], this_acc[3]});
+        reinterpret_cast<half2 *>(C_gmem + (row + 0) * N + col)[0] = __float22half2_rn({this_acc[0], this_acc[1]});
+        reinterpret_cast<half2 *>(C_gmem + (row + 8) * N + col)[0] = __float22half2_rn({this_acc[2], this_acc[3]});
       }
     }
 }

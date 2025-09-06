@@ -2,7 +2,6 @@
 // we will generate this file when JIT-compile the kernel.
 
 #include "common.h"
-#include <cuda/std/type_traits>  // for std::is_same_v
 #include <cuda_bf16.h>
 
 constexpr int BLOCK_M = 128;
