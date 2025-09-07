@@ -71,8 +71,8 @@ void matmul_kernel(
   constexpr int BUFFER_SIZE = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(TypeAB);
 
   // set up register memory
-  int A_rmem[WARP_M / MMA_M][BLOCK_K / 16][4];
-  int B_rmem[WARP_N / MMA_N][BLOCK_K / 16][2];
+  int A_rmem[WARP_M / MMA_M][BLOCK_K / MMA_K][4];
+  int B_rmem[WARP_N / MMA_N][BLOCK_K / MMA_K][2];
   int C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][sizeof(TypeAcc)] = {};  // 4 for FP32/INT32, 2 for FP16
 
   // pre-compute ldmatrix address and swizzling
