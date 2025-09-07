@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from gn_kernels.cuda_mm import MatmulKernel
+from gn_kernels.cuda_mm import MatmulKernel, int4x2, uint4x2
 
 
 @pytest.mark.parametrize("dtype_str", ["fp16", "bf16"])
@@ -29,7 +29,7 @@ def test_cuda_mm_int8():
 
     actual = kernel.run(A, B)
     torch.cuda.synchronize()
-    print(actual)
+
     expected = torch._int_mm(A, B)
     torch.testing.assert_close(actual, expected)
 
@@ -71,4 +71,29 @@ def test_cuda_mm_fp16_acc(dtype_str: str):
         expected.add_(torch.mm(A_tile, B_tile))
 
     # doesn't pass for FP16
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dtype_str", ["int4", "uint4"])
+def test_cuda_mm_int4(dtype_str: str):
+    dtype, low, high = dict(
+        int4=(int4x2, -8, 7),
+        uint4=(uint4x2, 0, 15),
+    )[dtype_str]
+    kernel = MatmulKernel(dtype, torch.int32, torch.int32, num_stages=2)
+
+    def pack_int4(x: torch.Tensor):
+        return (x[:, 1::2] << 4) | (x[:, ::2] & 0xF)
+
+    M, N, K = 512, 768, 1024
+    A = torch.randint(low, high, (M, K), dtype=torch.int8, device="cuda")
+    B = torch.randint(low, high, (N, K), dtype=torch.int8, device="cuda").T
+
+    A_packed = pack_int4(A)
+    B_packed = pack_int4(B.T).T
+
+    actual = kernel.run(A_packed, B_packed)
+    torch.cuda.synchronize()
+
+    expected = torch._int_mm(A, B)
     torch.testing.assert_close(actual, expected)

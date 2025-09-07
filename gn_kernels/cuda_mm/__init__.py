@@ -6,6 +6,15 @@ from torch import Tensor
 from torch.cuda._utils import _check_cuda, _get_cuda_library
 from torch.utils.cpp_extension import include_paths
 
+
+# sentinel object to represent int4 types
+class FakeType:
+    itemsize = 1
+
+
+int4x2 = FakeType()
+uint4x2 = FakeType()
+
 _TYPE_MAP = {
     torch.float32: "float",
     torch.float16: "half",
@@ -15,6 +24,8 @@ _TYPE_MAP = {
     torch.int32: "int",
     torch.int8: "signed char",
     torch.uint8: "unsigned char",
+    int4x2: "int4x2",
+    uint4x2: "uint4x2",
 }
 
 CURRENT_DIR = Path(__file__).parent

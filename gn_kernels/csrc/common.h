@@ -105,6 +105,9 @@ void ldmatrix_trans(int *regs, int addr) {
                 : "r"(addr));
 }
 
+struct int4x2 { char data; };
+struct uint4x2 { char data; };
+
 // https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html#constraints
 template <typename T>
 struct Type_str;
@@ -116,6 +119,9 @@ template<> struct Type_str<__nv_fp8_e5m2> { static constexpr const char value[] 
 // NOTE: according to C/C++ spec, sign-ness of char is implementation-defined
 template<> struct Type_str<signed char> { static constexpr const char value[] = "s8"; };
 template<> struct Type_str<unsigned char> { static constexpr const char value[] = "u8"; };
+// these types are defined by us
+template<> struct Type_str<int4x2> { static constexpr const char value[] = "s4"; };
+template<> struct Type_str<uint4x2> { static constexpr const char value[] = "u4"; };
 
 template <int element_size>
 struct MMA_shape_str;
@@ -129,7 +135,7 @@ void mma(int A[4], int B[2], void *C) {
               || cuda::std::is_same_v<ctype, half>
               || cuda::std::is_same_v<ctype, int>);
 
-  // use void * for input so that we can pass either float or int
+  // use void * for input so that we can pass either float or int pointer
   int *D = reinterpret_cast<int *>(C);
 
   // m16n8k16 for FP16/BF16
@@ -159,6 +165,19 @@ void mma(int A[4], int B[2], void *C) {
                   "r"(B[0]), "r"(B[1]),
                   "r"(D[0]), "r"(D[1]),
                   "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
+
+  // special case for INT4 MMA. override MMA shape
+  else if constexpr (cuda::std::is_same_v<atype, int4x2> || cuda::std::is_same_v<atype, uint4x2>)
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%14.s32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
   // TODO: maybe we can include .satfinite in the 1st case as well?
   else if constexpr (cuda::std::is_same_v<ctype, int>)
