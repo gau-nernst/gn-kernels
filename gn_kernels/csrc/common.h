@@ -168,7 +168,7 @@ void mma(int A[4], int B[2], void *C) {
 
   // special case for INT4 MMA. override MMA shape
   else if constexpr (cuda::std::is_same_v<atype, int4x2> || cuda::std::is_same_v<atype, uint4x2>)
-    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%14.s32 "
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%15.s32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
