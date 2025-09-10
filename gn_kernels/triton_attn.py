@@ -1,6 +1,5 @@
 # https://github.com/triton-lang/triton/blob/v3.3.1/python/tutorials/06-fused-attention.py
 
-import torch
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -27,6 +26,7 @@ def _triton_attn_kernel(
     BLOCK_N: tl.constexpr,
     sm_scale: float | None = None,
     SCALED_QK: tl.constexpr = False,
+    FP16_ACC: tl.constexpr = False,
 ):
     # tl.static_assert(BLOCK_N <= HEAD_DIM)
     pid_m = tl.program_id(0)  # better L2 reuse for K and V
@@ -92,20 +92,22 @@ def _triton_attn_kernel(
         # 1st matmul: S = Q @ K.T
         k = tl.load(K_block_ptr)  # [DIM_QK, BLOCK_N]
 
-        out_dtype: tl.constexpr = tl.int32 if q.type == tl.int8 else tl.float32
-        qk = tl.dot(q, k, out_dtype=out_dtype)  # [BLOCK_M, BLOCK_N]
-        qk = qk.to(tl.float32) * sm_scale
+        QK_DTYPE: tl.constexpr = (
+            tl.int32 if (q.type == tl.int32 and k.type == tl.int32) else tl.float16 if FP16_ACC else tl.float32
+        )
+        s = tl.dot(q, k, out_dtype=QK_DTYPE)  # [BLOCK_M, BLOCK_N]
+        s = s.to(tl.float32) * sm_scale
 
         if SCALED_QK:
             # NOTE: this is not pipelined
             scale_k = tl.load(scale_k_ptrs)  # [1, BLOCK_N]
-            qk *= scale_k
+            s *= scale_k
             scale_k_ptrs += BLOCK_N
 
         # softmax
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk -= m_ij[:, None]
-        p = tl.math.exp2(qk)
+        m_ij = tl.maximum(m_i, tl.max(s, 1))
+        s -= m_ij[:, None]
+        p = tl.math.exp2(s)
         l_ij = tl.sum(p, 1)
 
         alpha = tl.math.exp2(m_i - m_ij)  # rescale factor
@@ -158,9 +160,16 @@ triton_scaled_qk_attn_kernel = triton.autotune(
 )(_triton_attn_kernel)
 
 
-def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, scale_k: Tensor | None = None):
+def triton_attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale_q: Tensor | None = None,
+    scale_k: Tensor | None = None,
+    *,
+    fp16_acc: bool = False,
+):
     # TODO: support GQA
-    # TODO: check if (bs, nh, len, dim) layout is better for int8/fp8
     BS, LEN_Q, NUM_HEADS, DIM_QK = q.shape
     _, LEN_KV, _, DIM_V = v.shape
     assert k.shape == (BS, LEN_KV, NUM_HEADS, DIM_QK)
@@ -172,7 +181,7 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
     def grid(args):
         return (triton.cdiv(LEN_Q, args["BLOCK_M"]), NUM_HEADS, BS)
 
-    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V, dtype=torch.bfloat16)
+    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V, dtype=v.dtype)
 
     kwargs = dict(
         Q_ptr=q,
@@ -190,6 +199,7 @@ def triton_attn(q: Tensor, k: Tensor, v: Tensor, scale_q: Tensor | None = None, 
         NUM_HEADS=NUM_HEADS,
         DIM_QK=DIM_QK,
         DIM_V=DIM_V,
+        FP16_ACC=fp16_acc,
     )
 
     if scale_q is not None and scale_k is not None:
