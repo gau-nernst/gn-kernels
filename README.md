@@ -7,24 +7,22 @@ uv pip install git+https://github.com/gau-nernst/gn_kernels --no-build-isolation
 ```
 
 TODO:
-- Separate matmul and block-scaled matmul (mx and nvfp4)
-- Attention: triton
-- Triton persistent matmul kernel
+- Cutlass with NVRTC?
 
 Available kernels
 
-- SM80:
-  - Cutlass INT4 + rowwise-scaled INT4
-  - INT8 attention (QK only and QK+PV)
-- SM89: Cutlass FP8 + rowwise-scaled FP8
-- SM120:
-  - Cutlass FP8 + rowwise-scaled FP8
-  - Cutlass FP4 + rowwise-scaled FP4
-  - MXFP8 attention (QK only)
-- Triton:
-  - Matmul with configurable input dtype, accumulate dtype e.g. FP16 MMA with FP16 accumulate
-  - Rowwise-scaled matmul
-  - Tile-scaled matmul (i.e. DeepSeek style)
+- Cutlass
+  - Cutlass 2.x:
+    - SM80: INT4 mm and row-scaled mm
+    - SM89: FP8 mm and row-scaled mm
+  - Cutlass 3.x:
+    - SM120: FP8/FP4 mm and row-scaled mm
+- Triton
+  - Matmul with various input dtypes, FP16 accumulation, row-scaled and 2d-block-scaled (DeepSeek)
+  - Attention, optional QK in INT8/FP8 or FP16 accumulation
+- CUDA
+  - Matmul with various input dtypes, FP16 accumulation
+  - Attention
 
 ## Speed benchmarks
 
