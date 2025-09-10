@@ -123,11 +123,6 @@ template<> struct Type_str<unsigned char> { static constexpr const char value[] 
 template<> struct Type_str<int4x2> { static constexpr const char value[] = "s4"; };
 template<> struct Type_str<uint4x2> { static constexpr const char value[] = "u4"; };
 
-template <int element_size>
-struct MMA_shape_str;
-template<> struct MMA_shape_str<2> { static constexpr const char value[] = "m16n8k16"; };
-template<> struct MMA_shape_str<1> { static constexpr const char value[] = "m16n8k32"; };
-
 template <typename atype, typename btype, typename ctype>
 __device__ inline
 void mma(int A[4], int B[2], void *C) {
@@ -137,13 +132,11 @@ void mma(int A[4], int B[2], void *C) {
 
   // use void * for input so that we can pass either float or int pointer
   int *D = reinterpret_cast<int *>(C);
+  constexpr int MMA_K = 32 / sizeof(atype);  // 16 for FP16/BF16, 32 for FP8/INT8
 
-  // m16n8k16 for FP16/BF16
-  // m16n8k32 for FP8/INT8
-  using shape = MMA_shape_str<sizeof(atype)>;
-
+  // BF16/FP16/FP8 MMA with FP32 accumulate
   if constexpr (cuda::std::is_same_v<ctype, float>)
-    asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%16.f32 "
+    asm volatile("mma.sync.aligned.m16n8k%14.row.col.f32.%15.%16.f32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
@@ -152,10 +145,11 @@ void mma(int A[4], int B[2], void *C) {
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
                   "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
-                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
+                  "n"(MMA_K), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
+  // FP16/FP8 MMA with FP16 accumulate
   else if constexpr (cuda::std::is_same_v<ctype, half>)
-    asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%12.f16 "
+    asm volatile("mma.sync.aligned.m16n8k%10.row.col.f16.%11.%12.f16 "
                 "{%0, %1}, "
                 "{%2, %3, %4, %5}, "
                 "{%6, %7}, "
@@ -164,9 +158,9 @@ void mma(int A[4], int B[2], void *C) {
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
                   "r"(D[0]), "r"(D[1]),
-                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
+                  "n"(MMA_K), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
-  // special case for INT4 MMA. override MMA shape
+  // INT4 MMA. override MMA shape.
   else if constexpr (cuda::std::is_same_v<atype, int4x2> || cuda::std::is_same_v<atype, uint4x2>)
     asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%15.s32 "
                 "{%0, %1, %2, %3}, "
@@ -179,9 +173,9 @@ void mma(int A[4], int B[2], void *C) {
                   "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
                   "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
-  // TODO: maybe we can include .satfinite in the 1st case as well?
+  // INT8 MMA
   else if constexpr (cuda::std::is_same_v<ctype, int>)
-    asm volatile("mma.sync.aligned.%14.row.col.satfinite.s32.%15.%16.s32 "
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%14.%15.s32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
@@ -190,7 +184,7 @@ void mma(int A[4], int B[2], void *C) {
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
                   "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
-                  "C"(shape::value), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
+                  "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 }
 
 template <typename TypeAB>
