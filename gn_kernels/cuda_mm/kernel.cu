@@ -1,5 +1,4 @@
 #include "common.h"
-#include <cuda_bf16.h>
 
 constexpr int BLOCK_M = 128;
 constexpr int BLOCK_N = 128;
