@@ -4,3 +4,4 @@ extend-exclude = ["cutlass"]
 
 [tool.ruff.lint]
 extend-select = ["I"]
+ignore = ["F401"]

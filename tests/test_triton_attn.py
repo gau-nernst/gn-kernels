@@ -1,16 +1,16 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
 from gn_kernels.triton_attn import triton_attn
 
 
-def test_triton_attn():
+@pytest.mark.parametrize("len_q,len_kv", [(64, 256), (33, 123)])
+def test_triton_attn(len_q: int, len_kv: int):
     bs = 2
     num_heads_q = 8
     num_heads_kv = 4
     head_dim = 128
-    len_q = 64
-    len_kv = 256
 
     q = torch.randn(bs, len_q, num_heads_q, head_dim, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(bs, len_kv, num_heads_kv, head_dim, dtype=torch.bfloat16, device="cuda")
