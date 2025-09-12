@@ -7,19 +7,20 @@ from torch import Tensor
 
 @triton.jit
 def _triton_attn_kernel(
-    Q_ptr,  # [BS, LEN_Q, NUM_HEADS, DIM_QK]
-    K_ptr,  # [BS, LEN_KV, NUM_HEADS, DIM_QK]
-    V_ptr,  # [BS, LEN_KV, NUM_HEADS, DIM_V]
-    O_ptr,  # [BS, LEN_Q, NUM_HEADS, DIM_V]
-    scale_Q_ptr,  # [BS, NUM_HEADS, LEN_Q]
-    scale_K_ptr,  # [BS, NUM_HEADS, LEN_KV]
+    Q_ptr,  # [BS, LEN_Q, NUM_HEADS_Q, DIM_QK]
+    K_ptr,  # [BS, LEN_KV, NUM_HEADS_KV, DIM_QK]
+    V_ptr,  # [BS, LEN_KV, NUM_HEADS_KV, DIM_V]
+    O_ptr,  # [BS, LEN_Q, NUM_HEADS_Q, DIM_V]
+    scale_Q_ptr,  # [BS, NUM_HEADS_Q, LEN_Q]
+    scale_K_ptr,  # [BS, NUM_HEADS_KV, LEN_KV]
     stride_Q,
     stride_K,
     stride_V,
     stride_O,
     LEN_Q: int,
     LEN_KV: int,
-    NUM_HEADS: int,
+    NUM_HEADS_Q: int,
+    NUM_HEADS_KV: int,
     DIM_QK: tl.constexpr,
     DIM_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -29,17 +30,18 @@ def _triton_attn_kernel(
     FP16_ACC: tl.constexpr = False,
 ):
     # tl.static_assert(BLOCK_N <= HEAD_DIM)
-    pid_m = tl.program_id(0)  # better L2 reuse for K and V
-    head_id = tl.program_id(1)
+    head_id_q = tl.program_id(0)  # L2 reuse of KV across heads
+    head_id_kv = head_id_q // (NUM_HEADS_Q // NUM_HEADS_KV)
+    pid_m = tl.program_id(1)
     bs_id = tl.program_id(2)
 
-    Q_ptr += (bs_id * stride_Q[0]) + (pid_m * BLOCK_M * stride_Q[1]) + (head_id * stride_Q[2])
-    K_ptr += (bs_id * stride_K[0]) + (head_id * stride_K[2])
-    V_ptr += (bs_id * stride_V[0]) + (head_id * stride_V[2])
-    O_ptr += (bs_id * stride_O[0]) + (pid_m * BLOCK_M * stride_O[1]) + (head_id * stride_O[2])
+    Q_ptr += (bs_id * stride_Q[0]) + (pid_m * BLOCK_M * stride_Q[1]) + (head_id_q * stride_Q[2])
+    O_ptr += (bs_id * stride_O[0]) + (pid_m * BLOCK_M * stride_O[1]) + (head_id_q * stride_O[2])
+    K_ptr += (bs_id * stride_K[0]) + (head_id_kv * stride_K[2])
+    V_ptr += (bs_id * stride_V[0]) + (head_id_kv * stride_V[2])
     if SCALED_QK:
-        scale_Q_ptr += (bs_id * NUM_HEADS * LEN_Q) + (head_id * LEN_Q) + (pid_m * BLOCK_M)
-        scale_K_ptr += (bs_id * NUM_HEADS * LEN_KV) + (head_id * LEN_KV)
+        scale_Q_ptr += (bs_id * NUM_HEADS_Q * LEN_Q) + (head_id_q * LEN_Q) + (pid_m * BLOCK_M)
+        scale_K_ptr += (bs_id * NUM_HEADS_KV * LEN_KV) + (head_id_kv * LEN_KV)
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
@@ -169,19 +171,19 @@ def triton_attn(
     *,
     fp16_acc: bool = False,
 ):
-    # TODO: support GQA
-    BS, LEN_Q, NUM_HEADS, DIM_QK = q.shape
-    _, LEN_KV, _, DIM_V = v.shape
-    assert k.shape == (BS, LEN_KV, NUM_HEADS, DIM_QK)
-    assert v.shape == (BS, LEN_KV, NUM_HEADS, DIM_V)
+    BS, LEN_Q, NUM_HEADS_Q, DIM_QK = q.shape
+    _, LEN_KV, NUM_HEADS_KV, DIM_V = v.shape
+    assert NUM_HEADS_Q % NUM_HEADS_KV == 0
+    assert k.shape == (BS, LEN_KV, NUM_HEADS_KV, DIM_QK)
+    assert v.shape == (BS, LEN_KV, NUM_HEADS_KV, DIM_V)
     assert q.stride(-1) == 1
     assert k.stride(-1) == 1
     assert v.stride(-1) == 1
 
     def grid(args):
-        return (triton.cdiv(LEN_Q, args["BLOCK_M"]), NUM_HEADS, BS)
+        return (NUM_HEADS_Q, triton.cdiv(LEN_Q, args["BLOCK_M"]), BS)
 
-    o = q.new_empty(BS, LEN_Q, NUM_HEADS, DIM_V, dtype=v.dtype)
+    o = q.new_empty(BS, LEN_Q, NUM_HEADS_Q, DIM_V, dtype=v.dtype)
 
     kwargs = dict(
         Q_ptr=q,
@@ -196,15 +198,16 @@ def triton_attn(
         stride_O=o.stride(),
         LEN_Q=LEN_Q,
         LEN_KV=LEN_KV,
-        NUM_HEADS=NUM_HEADS,
+        NUM_HEADS_Q=NUM_HEADS_Q,
+        NUM_HEADS_KV=NUM_HEADS_KV,
         DIM_QK=DIM_QK,
         DIM_V=DIM_V,
         FP16_ACC=fp16_acc,
     )
 
     if scale_q is not None and scale_k is not None:
-        assert scale_q.shape == (BS, NUM_HEADS, LEN_Q)
-        assert scale_k.shape == (BS, NUM_HEADS, LEN_KV)
+        assert scale_q.shape == (BS, NUM_HEADS_Q, LEN_Q)
+        assert scale_k.shape == (BS, NUM_HEADS_KV, LEN_KV)
         assert scale_q.is_contiguous()
         assert scale_k.is_contiguous()
 
