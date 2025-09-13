@@ -17,30 +17,26 @@ def _forward_loop(
     v_stride,
     offs_m,
     sm_scale,
-    BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr,
-    SCALED_QK: tl.constexpr,
-    QK_ACC_DTYPE: tl.constexpr,
-    PV_ACC_DTYPE: tl.constexpr,
-    BOUNDS_CHECK: tl.constexpr,
+    CONSTEXPR_ARGS: tl.constexpr,
 ):
     acc, m_i, l_i = attn_state
     start, end, KV_LEN = limits
+    BLOCK_N, CAUSAL, SCALED_QK, QK_ACC_DTYPE, PV_ACC_DTYPE, BOUNDS_CHECK = CONSTEXPR_ARGS
 
     offs_n = start + tl.arange(0, BLOCK_N)
-    kv_mask = offs_n < KV_LEN
 
     for _ in range(tl.cdiv(end - start, BLOCK_N)):
+        kv_mask = offs_n < KV_LEN
+
         # 1st matmul: S = Q @ K.T
         k = tl.load(k_ptrs, kv_mask[None, :] if BOUNDS_CHECK else None)
         s = tl.dot(q, k, out_dtype=QK_ACC_DTYPE)  # [BLOCK_M, BLOCK_N]
         s = s.to(tl.float32) * sm_scale
 
-        if SCALED_QK:
-            # NOTE: this is not pipelined
-            scale_k = tl.load(scale_k_ptrs)  # [1, BLOCK_N]
-            s *= scale_k
+        if SCALED_QK:  # NOTE: this is not pipelined
+            s *= tl.load(scale_k_ptrs)  # [1, BLOCK_N]
 
+        # TODO: merge the masks?
         if BOUNDS_CHECK:
             s = tl.where(kv_mask[None, :], s, float("-inf"))
 
@@ -156,29 +152,11 @@ def triton_attn_kernel(
     else:
         scale_k_ptrs = None
 
-    # main loop: iterate over k, v and update accumulator
     if not CAUSAL:
         # for non-causal, we need to do bounds check for the last block to avoid out-of-bounds read.
         # just do bounds check for all blocks for now, since separating out the last block may cause
         # problems with pipelining.
-        acc, m_i, l_i = _forward_loop(
-            (acc, m_i, l_i),
-            (0, KV_LEN, KV_LEN),
-            q,
-            k_ptrs,
-            v_ptrs,
-            scale_k_ptrs,
-            K_stride[1],
-            V_stride[1],
-            offs_m,
-            sm_scale,
-            BLOCK_N,
-            CAUSAL,
-            SCALED_QK,
-            QK_ACC_DTYPE,
-            PV_ACC_DTYPE,
-            BOUNDS_CHECK,
-        )
+        end = KV_LEN
 
     else:
         # for causal, we align the last q with the last kv i.e. causal lower right. this is FA's
@@ -196,18 +174,44 @@ def triton_attn_kernel(
         # we also enable bounds check for the partial blocks loop, since the partial blocks are
         # guaranteed to contain the last block.
 
-        # for causal mask within a block
+        # end is rounded down to a multiple of BLOCK_N
+        end = (KV_LEN - Q_LEN + pid_m * BLOCK_M) // BLOCK_N * BLOCK_N
+
+    # full blocks
+    # always set CAUSAL=False and only set BOUNDS_CHECK for non-causal
+    FULL_ARGS: tl.constexpr = (BLOCK_N, False, SCALED_QK, QK_ACC_DTYPE, PV_ACC_DTYPE, False if CAUSAL else BOUNDS_CHECK)
+    acc, m_i, l_i = _forward_loop(
+        (acc, m_i, l_i),
+        (0, end, KV_LEN),
+        q,
+        k_ptrs,
+        v_ptrs,
+        scale_k_ptrs,
+        K_stride[1],
+        V_stride[1],
+        None,  # offs_m
+        sm_scale,
+        FULL_ARGS,
+    )
+
+    if CAUSAL:
+        # handle partial blocks in causal attention
+        start = end
+        end = KV_LEN - Q_LEN + (pid_m + 1) * BLOCK_M
+
+        k_ptrs += start * K_stride[1]
+        v_ptrs += start * V_stride[1]
+        if SCALED_QK:
+            scale_k_ptrs += start
+
+        # this is only used for causal mask within a block
         # to use causal upper left, remove this line
         offs_m += KV_LEN - Q_LEN
 
-        # th1 is rounded down to a multiple of BLOCK_N
-        th1 = (KV_LEN - Q_LEN + pid_m * BLOCK_M) // BLOCK_N * BLOCK_N
-        th2 = KV_LEN - Q_LEN + (pid_m + 1) * BLOCK_M
-
-        # full blocks
+        PARTIAL_ARGS: tl.constexpr = (BLOCK_N, CAUSAL, SCALED_QK, QK_ACC_DTYPE, PV_ACC_DTYPE, BOUNDS_CHECK)
         acc, m_i, l_i = _forward_loop(
             (acc, m_i, l_i),
-            (0, th1, KV_LEN),
+            (start, end, KV_LEN),
             q,
             k_ptrs,
             v_ptrs,
@@ -216,37 +220,7 @@ def triton_attn_kernel(
             V_stride[1],
             offs_m,
             sm_scale,
-            BLOCK_N,
-            CAUSAL,
-            SCALED_QK,
-            QK_ACC_DTYPE,
-            PV_ACC_DTYPE,
-            BOUNDS_CHECK=False,
-        )
-
-        k_ptrs += th1 * K_stride[1]
-        v_ptrs += th1 * V_stride[1]
-        if SCALED_QK:
-            scale_k_ptrs += th1
-
-        # partial blocks
-        acc, m_i, l_i = _forward_loop(
-            (acc, m_i, l_i),
-            (th1, th2, KV_LEN),
-            q,
-            k_ptrs,
-            v_ptrs,
-            scale_k_ptrs,
-            K_stride[1],
-            V_stride[1],
-            offs_m,
-            sm_scale,
-            BLOCK_N,
-            CAUSAL,
-            SCALED_QK,
-            QK_ACC_DTYPE,
-            PV_ACC_DTYPE,
-            BOUNDS_CHECK,
+            PARTIAL_ARGS,
         )
 
     # epilogue
