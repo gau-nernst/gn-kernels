@@ -19,10 +19,14 @@ Available kernels
     - SM120: FP8/FP4 mm and row-scaled mm
 - Triton
   - Matmul with various input dtypes, FP16 accumulation, row-scaled and 2d-block-scaled (DeepSeek)
-  - Attention, optional QK in INT8/FP8 or FP16 accumulation
+  - Attention:
+    - GQA, causal
+    - Optional QK with INT8/FP8 MMA
+    - Optional QK and PV with FP16 accumulation
+    - TODO: varlen, paged
 - CUDA
-  - Matmul with various input dtypes, FP16 accumulation
-  - Attention
+  - Matmul with various input dtypes and FP16 accumulation
+  - Attention: optional QK with INT8/FP8 MMA
 
 ## Speed benchmarks
 
