@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from ..cuda_utils import _TYPE_MAP, _compile_kernel, cdiv
+from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
 CURRENT_DIR = Path(__file__).parent
 MARKER = "// start of kernel"

@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from gn_kernels.cuda_mm import MatmulKernel
-from gn_kernels.cuda_utils import int4x2, uint4x2
+from gn_kernels.nvrtc_utils import int4x2, uint4x2
 
 
 @pytest.mark.parametrize("dtype_str", ["fp16", "bf16"])
