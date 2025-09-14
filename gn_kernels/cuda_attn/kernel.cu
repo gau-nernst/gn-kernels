@@ -13,20 +13,20 @@ extern "C"
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void attn_kernel(
-  const Type *Q_gmem,  // [bs, len_q, num_heads, QK_DIM]
-  const Type *K_gmem,  // [bs, len_kv, num_heads, QK_DIM]
-  const Type *V_gmem,  // [bs, len_kv, num_heads, V_DIM]
-        Type *O_gmem,  // [bs, len_q, num_heads, V_DIM]
+  const Type *Q_gmem,  // [bs, q_len, q_heads, QK_DIM]
+  const Type *K_gmem,  // [bs, kv_len, kv_heads, QK_DIM]
+  const Type *V_gmem,  // [bs, kv_len, kv_heads, V_DIM]
+        Type *O_gmem,  // [bs, q_len, q_heads, V_DIM]
   // strides
   int Q_s0, int Q_s1, int Q_s2,
   int K_s0, int K_s1, int K_s2,
   int V_s0, int V_s1, int V_s2,
   int O_s0, int O_s1, int O_s2,
   // problem shape
-  int bs,
-  int len_q,
-  int len_kv,
-  int num_heads
+  int q_len,
+  int kv_len,
+  int q_heads,
+  int kv_heads
 ) {
   static_assert(cuda::std::is_same_v<Type, nv_bfloat16>
               || cuda::std::is_same_v<Type, half>);
@@ -38,9 +38,11 @@ void attn_kernel(
   const int lane_id = tid % WARP_SIZE;
 
   // each threadblock handles 1 BLOCK_Q
-  const int q_block_id = blockIdx.x;
-  const int head_id = blockIdx.y;
+  const int q_head_id = blockIdx.x;
+  const int q_block_id = blockIdx.y;
   const int bs_id = blockIdx.z;
+
+  const int kv_head_id = q_head_id / (q_heads / kv_heads);
 
   // FA2: shard BLOCK_Q among all warps
   // replicate K and V on all warps
@@ -50,10 +52,10 @@ void attn_kernel(
   constexpr int MMA_K = 16;
 
   const int q_offset = q_block_id * BLOCK_Q;
-  Q_gmem += (bs_id * Q_s0) + (q_offset * Q_s1) + (head_id * Q_s2);
-  O_gmem += (bs_id * O_s0) + (q_offset * O_s1) + (head_id * O_s2);
-  K_gmem += (bs_id * K_s0) + (head_id * K_s2);
-  V_gmem += (bs_id * V_s0) + (head_id * V_s2);
+  Q_gmem += (bs_id * Q_s0) + (q_offset * Q_s1) + (q_head_id * Q_s2);
+  O_gmem += (bs_id * O_s0) + (q_offset * O_s1) + (q_head_id * O_s2);
+  K_gmem += (bs_id * K_s0) + (kv_head_id * K_s2);
+  V_gmem += (bs_id * V_s0) + (kv_head_id * V_s2);
 
   // we overlap Q_smem with (K_smem + V_smem)
   extern __shared__ char smem[];
@@ -124,7 +126,7 @@ void attn_kernel(
       ldmatrix<4>(Q_rmem[mma_id_q][mma_id_d], addr);
     }
 
-  const int num_kv_iter = cdiv(len_kv, BLOCK_KV);
+  const int num_kv_iter = cdiv(kv_len, BLOCK_KV);
 
   // TODO: more flexible prefetch
   auto load_K = [&](int kv_id) {

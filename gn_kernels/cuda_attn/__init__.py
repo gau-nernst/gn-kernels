@@ -56,11 +56,11 @@ class AttnKernel:
         assert k.stride(-1) == 1
         assert v.stride(-1) == 1
 
-        bs, len_q, num_heads, _ = q.shape
-        _, len_kv, _, _ = k.shape
-        o = q.new_empty(bs, len_q, num_heads, self.v_dim)
+        bs, len_q, q_heads, _ = q.shape
+        _, len_kv, kv_heads, _ = k.shape
+        o = q.new_empty(bs, len_q, q_heads, self.v_dim)
 
-        grid = (cdiv(len_q, self.block_q), num_heads, bs)
+        grid = (q_heads, cdiv(len_q, self.block_q), bs)
         args = (
             q,
             k,
@@ -70,10 +70,10 @@ class AttnKernel:
             *k.stride()[:3],
             *v.stride()[:3],
             *o.stride()[:3],
-            bs,
             len_q,
             len_kv,
-            num_heads,
+            q_heads,
+            kv_heads,
         )
         self.kernel(grid, self.tb_size, args, self.smem_size)
         return o
