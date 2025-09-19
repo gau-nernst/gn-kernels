@@ -4,7 +4,9 @@ import torch
 from triton.testing import do_bench
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()
+FP8_DTYPE = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
 torch.set_default_device("cuda")
+torch._dynamo.config.recompile_limit = 10000
 
 best = {k: (0, 0) for k in ("bf16", "int8", "fp8", "mxfp8", "nvfp4")}
 
@@ -14,6 +16,7 @@ for dim in dims:
     print(f"{M=}, {N=}, {K=}")
 
     def bench_tflops(f, *args, **kwargs):
+        f(*args, **kwargs)
         time.sleep(0.5)
         latency = do_bench(lambda: f(*args, **kwargs), return_mode="median") * 1e-3
         return (2 * M * N * K) / latency * 1e-12
@@ -23,22 +26,24 @@ for dim in dims:
     tflops = bench_tflops(torch.mm, A, B)
     best["bf16"] = max(best["bf16"], (tflops, dim))
 
+    # default torch._int_mm on MI300X is slow
     A = torch.randint(-128, 127, size=(M, K), dtype=torch.int8)
     B = torch.randint(-128, 127, size=(N, K), dtype=torch.int8).T
-    tflops = bench_tflops(torch._int_mm, A, B)
+    compiled_int_mm = torch.compile(torch._int_mm, dynamic=False, mode="max-autotune-no-cudagraphs")
+    tflops = bench_tflops(compiled_int_mm, A, B)
     best["int8"] = max(best["int8"], (tflops, dim))
 
     if COMPUTE_CAPABILITY >= (8, 9):
-        A = torch.randn(M, K).to(torch.float8_e4m3fn)
-        B = torch.randn(N, K).to(torch.float8_e4m3fn).T
+        A = torch.randn(M, K).to(FP8_DTYPE)
+        B = torch.randn(N, K).to(FP8_DTYPE).T
         scale_A = torch.randn(M, 1)
         scale_B = torch.randn(N, 1).T
         tflops = bench_tflops(torch._scaled_mm, A, B, scale_A, scale_B, out_dtype=torch.bfloat16)
         best["fp8"] = max(best["fp8"], (tflops, dim))
 
     if COMPUTE_CAPABILITY >= (10, 0):
-        A = torch.randn(M, K).to(torch.float8_e4m3fn)
-        B = torch.randn(N, K).to(torch.float8_e4m3fn).T
+        A = torch.randn(M, K).to(FP8_DTYPE)
+        B = torch.randn(N, K).to(FP8_DTYPE).T
         scale_A = torch.randn(M, K // 32).to(torch.float8_e8m0fnu)
         scale_B = torch.randn(N, K // 32).to(torch.float8_e8m0fnu)
         tflops = bench_tflops(torch._scaled_mm, A, B, scale_A, scale_B, out_dtype=torch.bfloat16)

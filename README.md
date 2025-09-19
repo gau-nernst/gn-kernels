@@ -34,11 +34,14 @@ Available kernels
 
 Sweep over large matmul shapes and get the max achieved TFLOPS.
 
-Device name | BF16 | INT8 | FP8 | MXFP8 | NVFP4
-------------|------|------|-----|-------|------
-5090 @ 600W | 245.80 | 726.34 | 480.37 | 659.95 | 1306.48
-5090 @ 400W | 229.55 | 602.79 | 447.50 | 552.20 | 1165.04
+Device name     | BF16   | INT8   | FP8    | MXFP8  | NVFP4
+----------------|--------|--------|--------|--------|--------
 PRO 6000 @ 600W | 427.62 | 795.87 | 789.28 | 741.56 | 1425.95
+5090 @ 600W     | 245.80 | 726.34 | 480.37 | 659.95 | 1306.48
+5090 @ 400W     | 229.55 | 602.79 | 447.50 | 552.20 | 1165.04
+MI300X @ 750W   | 660.48 | 887.66 | 1197.41
+
+Note: INT8 matmul implementation I'm using on MI300x is probably not good.
 
 ### Matmul
 
