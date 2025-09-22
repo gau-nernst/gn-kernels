@@ -1,19 +1,15 @@
 #include <hip/hip_bf16.h>
+#include <torch/library.h>
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAStream.h>
 
-constexpr int BLOCK_M = 64;
-constexpr int BLOCK_N = 64;
-constexpr int BLOCK_K = 64;
-constexpr int GROUP_M = 4;
-
-constexpr int NUM_WARP_M = 2;
-constexpr int NUM_WARP_N = 2;
 
 constexpr int WARP_SIZE = 64;
 
-__device__
+__device__ __host__
 constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-// start of kernel
+template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int GROUP_M, int NUM_WARP_M, int NUM_WARP_N>
 __global__
 void matmul_kernel(
   const hip_bfloat16 *A_gmem,
@@ -64,4 +60,39 @@ void matmul_kernel(
   extern __shared__ hip_bfloat16 smem[];
   hip_bfloat16 *A_smem = smem;
   hip_bfloat16 *B_smem = A_smem + BLOCK_M * BLOCK_K * sizeof(hip_bfloat16);
+}
+
+void matmul(const at::Tensor& A, const at::Tensor& B, at::Tensor& C) {
+  hipStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  constexpr int BLOCK_M = 128;
+  constexpr int BLOCK_N = 128;
+  constexpr int BLOCK_K = 64;
+  constexpr int GROUP_M = 4;
+
+  constexpr int NUM_WARP_M = 2;
+  constexpr int NUM_WARP_N = 2;
+
+  const int M = A.size(0);
+  const int N = B.size(1);
+  const int K = A.size(1);
+
+  const int grid_m = cdiv(M, BLOCK_M);
+  const int grid_n = cdiv(N, BLOCK_N);
+  const int grid_size = grid_m * grid_n;
+  const int tb_size = NUM_WARP_M * NUM_WARP_N * WARP_SIZE;
+  const int smem_size = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(hip_bfloat16);
+
+  auto A_gmem = reinterpret_cast<const hip_bfloat16 *>(A.data_ptr());
+  auto B_gmem = reinterpret_cast<const hip_bfloat16 *>(B.data_ptr());
+  auto C_gmem = reinterpret_cast<hip_bfloat16 *>(C.data_ptr());
+
+  matmul_kernel<BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, NUM_WARP_M, NUM_WARP_N><<<grid_size, tb_size, smem_size>>>(
+    A_gmem, B_gmem, C_gmem, M, N, K
+  );
+}
+
+TORCH_LIBRARY(gn_kernels_hip, m) {
+  m.def("matmul(Tensor A, Tensor B, Tensor(a!) C) -> ()");
+  m.impl("matmul", at::kCUDA, &matmul);
 }
