@@ -8,12 +8,21 @@ FP8_DTYPE = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
 torch.set_default_device("cuda")
 torch._dynamo.config.recompile_limit = 10000
 
-best = {k: (0, 0) for k in ("bf16", "int8", "fp8", "mxfp8", "nvfp4")}
+best = {k: (0, 0) for k in ("membw", "bf16", "int8", "fp8", "mxfp8", "nvfp4")}
 
 dims = list(range(4096, 8192, 512)) + list(range(8192, 16384, 1024))
 for dim in dims:
     M = N = K = dim
     print(f"{M=}, {N=}, {K=}")
+
+    # measure BW
+    A = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+    B = torch.randint(0, 255, (M, K), dtype=torch.uint8)
+    B.copy_(A)
+    time.sleep(0.5)
+    latency = do_bench(lambda: B.copy_(A), return_mode="median") * 1e-3
+    membw = 2 * M * K / latency * 1e-9
+    best["membw"] = max(best["membw"], (membw, dim))
 
     def bench_tflops(f, *args, **kwargs):
         f(*args, **kwargs)
@@ -57,5 +66,9 @@ for dim in dims:
         best["nvfp4"] = max(best["nvfp4"], (tflops, dim))
 
 print(torch.cuda.get_device_name())
+
+membw, dim = best.pop("membw")
+print(f"Mem BW: {membw:.2f} GB/s, {dim=}")
+
 for k, (tflops, dim) in best.items():
     print(f"{k}: {tflops:.2f} TFLOPS, {dim=}")
