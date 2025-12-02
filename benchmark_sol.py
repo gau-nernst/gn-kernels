@@ -1,10 +1,12 @@
+import argparse
 import time
-
-import torch
-from triton.testing import do_bench
 
 
 def benchmark_sol():
+    # local imports so that we can run this function on modal from a CPU machine.
+    import torch
+    from triton.testing import do_bench
+
     COMPUTE_CAPABILITY = torch.cuda.get_device_capability()
     FP8_DTYPE = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
     torch.set_default_device("cuda")
@@ -77,4 +79,24 @@ def benchmark_sol():
 
 
 if __name__ == "__main__":
-    benchmark_sol()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--modal")  # see available options: https://modal.com/docs/guide/gpu
+    args = parser.parse_args()
+
+    # run locally
+    if args.modal is None:
+        benchmark_sol()
+
+    # run on modal
+    else:
+        import modal
+
+        app = modal.App("benchmark-SOL")
+        image = modal.Image.debian_slim(python_version="3.12").uv_pip_install("torch==2.9.1")
+
+        @app.function(image=image, gpu=args.modal, serialized=True)
+        def benchmark_modal():
+            benchmark_sol()
+
+        with modal.enable_output(), app.run():
+            benchmark_modal.remote()
