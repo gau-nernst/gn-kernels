@@ -3,6 +3,9 @@
 Kernels in this folder can be installed as a package to provide code sharing for my projects.
 
 ```bash
+# CUDA version must match your nvcc version
+uv pip install torch>=2.10 --index-url https://download.pytorch.org/whl/cu130
+
 uv pip install git+https://github.com/gau-nernst/gn_kernels --no-build-isolation
 ```
 

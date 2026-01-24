@@ -49,7 +49,8 @@ class AttnKernel:
             self.block_kv,
             self.num_warps,
         )
-        self.kernel = _compile_kernel(KERNEL, "attn_kernel", header, self.smem_size)
+        self.kernel = _compile_kernel(KERNEL, "attn_kernel", header)
+        self.kernel.set_shared_memory_config(self.smem_size)
 
     def run(self, q: Tensor, k: Tensor, v: Tensor):
         assert q.stride(-1) == 1

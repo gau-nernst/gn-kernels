@@ -53,7 +53,8 @@ class MatmulKernel:
             _TYPE_MAP[self.out_dtype],
             _TYPE_MAP[self.acc_dtype],
         )
-        self.kernel = _compile_kernel(KERNEL, "matmul_kernel", header, self.smem_size)
+        self.kernel = _compile_kernel(KERNEL, "matmul_kernel", header)
+        self.kernel.set_shared_memory_config(self.smem_size)
 
     def run(self, A: Tensor, B: Tensor):
         assert A.stride(1) == 1
