@@ -30,15 +30,18 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _compile_kernel(kernel_source: str, kernel_name: str, header_code: str):
-    # not sure why we need to manually add CCCL include. new changes in CUDA 13?
-    include_dirs = [
-        str(Path(CUDA_HOME) / "include" / "cccl"),
-        str(Path(__file__).parent / "csrc"),
-    ]
+# not sure why we need to manually add CCCL include. new changes in CUDA 13?
+_include_dirs = (
+    str(Path(CUDA_HOME) / "include" / "cccl"),
+    str(Path(__file__).parent / "csrc"),
+)
 
-    return torch.cuda._compile_kernel(
-        kernel_source=f"{header_code}\n{kernel_source}",
+
+def _compile_kernel(kernel_source: str, kernel_name: str, smem_size: int):
+    kernel = torch.cuda._compile_kernel(
+        kernel_source=kernel_source,
         kernel_name=kernel_name,
-        cuda_include_dirs=include_dirs,
+        cuda_include_dirs=_include_dirs,
     )
+    kernel.set_shared_memory_config(smem_size)
+    return kernel

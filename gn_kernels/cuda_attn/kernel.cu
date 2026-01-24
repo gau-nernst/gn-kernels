@@ -1,15 +1,13 @@
 #include "common.h"
 
-constexpr int QK_DIM = 128;
-constexpr int V_DIM = 128;
-using Type = nv_bfloat16;
-
-constexpr int BLOCK_Q = 64;
-constexpr int BLOCK_KV = 64;
-constexpr int NUM_WARPS = 4;
-
-// start of kernel
-extern "C"
+template <
+  int BLOCK_Q,
+  int BLOCK_KV,
+  int NUM_WARPS,
+  int QK_DIM,
+  int V_DIM,
+  typename Type
+>
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
 void attn_kernel(

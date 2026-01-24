@@ -7,20 +7,7 @@ from torch import Tensor
 from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
 CURRENT_DIR = Path(__file__).parent
-MARKER = "// start of kernel"
-_, KERNEL = open(CURRENT_DIR / "kernel.cu").read().split(MARKER)
-
-HEADER_TEMPLATE = """
-#include "common.h"
-
-constexpr int QK_DIM = {};
-constexpr int V_DIM = {};
-using Type = {};
-
-constexpr int BLOCK_Q = {};
-constexpr int BLOCK_KV = {};
-constexpr int NUM_WARPS = {};
-"""
+KERNEL = open(CURRENT_DIR / "kernel.cu").read()
 
 
 @dataclasses.dataclass
@@ -41,16 +28,9 @@ class AttnKernel:
         v_size = self.block_kv * self.v_dim
         self.smem_size = max(q_size, k_size + v_size) * self.dtype.itemsize
 
-        header = HEADER_TEMPLATE.format(
-            self.qk_dim,
-            self.v_dim,
-            _TYPE_MAP[self.dtype],
-            self.block_q,
-            self.block_kv,
-            self.num_warps,
-        )
-        self.kernel = _compile_kernel(KERNEL, "attn_kernel", header)
-        self.kernel.set_shared_memory_config(self.smem_size)
+        template_args = [self.block_q, self.block_kv, self.num_warps, self.qk_dim, self.v_dim, _TYPE_MAP[self.dtype]]
+        kernel_name = f"attn_kernel<{', '.join(map(str, template_args))}>"
+        self.kernel = _compile_kernel(KERNEL, kernel_name, self.smem_size)
 
     def run(self, q: Tensor, k: Tensor, v: Tensor):
         assert q.stride(-1) == 1

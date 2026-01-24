@@ -7,26 +7,7 @@ from torch import Tensor
 from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
 CURRENT_DIR = Path(__file__).parent
-MARKER = "// start of kernel"
-_, KERNEL = open(CURRENT_DIR / "kernel.cu").read().split(MARKER)
-
-HEADER_TEMPLATE = """
-#include "common.h"
-
-constexpr int BLOCK_M = {};
-constexpr int BLOCK_N = {};
-constexpr int BLOCK_K = {};
-constexpr int GROUP_M = {};
-
-constexpr int NUM_WARP_M = {};
-constexpr int NUM_WARP_N = {};
-
-constexpr int NUM_STAGES = {};
-
-using TypeAB = {};
-using TypeC = {};
-using TypeAcc = {};
-"""
+KERNEL = open(CURRENT_DIR / "kernel.cu").read()
 
 
 @dataclasses.dataclass
@@ -44,17 +25,19 @@ class MatmulKernel:
         BM, BN, BK = self.block_mnk
         self.smem_size = (BM + BN) * BK * self.in_dtype.itemsize * self.num_stages
 
-        header = HEADER_TEMPLATE.format(
-            *self.block_mnk,
+        template_args = [
+            BM,
+            BN,
+            BK,
             self.group_m,
             *self.warp_mn,
             self.num_stages,
             _TYPE_MAP[self.in_dtype],
             _TYPE_MAP[self.out_dtype],
             _TYPE_MAP[self.acc_dtype],
-        )
-        self.kernel = _compile_kernel(KERNEL, "matmul_kernel", header)
-        self.kernel.set_shared_memory_config(self.smem_size)
+        ]
+        kernel_name = f"matmul_kernel<{', '.join(map(str, template_args))}>"
+        self.kernel = _compile_kernel(KERNEL, kernel_name, self.smem_size)
 
     def run(self, A: Tensor, B: Tensor):
         assert A.stride(1) == 1

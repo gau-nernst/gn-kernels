@@ -1,21 +1,17 @@
 #include "common.h"
 
-constexpr int BLOCK_M = 128;
-constexpr int BLOCK_N = 128;
-constexpr int BLOCK_K = 64;
-constexpr int GROUP_M = 8;
-
-constexpr int NUM_WARP_M = 2;
-constexpr int NUM_WARP_N = 2;
-
-constexpr int NUM_STAGES = 1;
-
-using TypeAB = nv_bfloat16;
-using TypeC = nv_bfloat16;
-using TypeAcc = float;
-
-// start of kernel
-extern "C"
+template <
+  int BLOCK_M,
+  int BLOCK_N,
+  int BLOCK_K,
+  int GROUP_M,
+  int NUM_WARP_M,
+  int NUM_WARP_N,
+  int NUM_STAGES,
+  typename TypeAB,
+  typename TypeC,
+  typename TypeAcc
+>
 __launch_bounds__(NUM_WARP_M * NUM_WARP_N * WARP_SIZE)
 __global__
 void matmul_kernel(
