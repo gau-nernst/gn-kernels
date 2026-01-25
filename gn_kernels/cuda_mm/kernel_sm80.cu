@@ -106,30 +106,28 @@ void matmul_sm80_kernel(
 
   auto compute = [&](int stage_id) {
     // A smem->rmem
-    for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-      for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++) {
+    for (int m = 0; m < WARP_M / MMA_M; m++)
+      for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         int addr = A_smem_thread + stage_id * STAGE_SIZE;
-        addr += mma_id_m * MMA_M * BLOCK_K * sizeof(TypeAB);
-        addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
-        ldmatrix<4>(A_rmem[mma_id_m][mma_id_k], addr);
+        addr += m * MMA_M * BLOCK_K * sizeof(TypeAB);
+        addr ^= k * MMA_K * sizeof(TypeAB);
+        ldmatrix<4>(A_rmem[m][k], addr);
       }
 
     // B smem->rmem
-    for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
-      for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k += 2) {
+    for (int n = 0; n < WARP_N / MMA_N; n++)
+      for (int k = 0; k < BLOCK_K / MMA_K; k += 2) {
         int addr = B_smem_thread + stage_id * STAGE_SIZE;
-        addr += mma_id_n * MMA_N * BLOCK_K * sizeof(TypeAB);
-        addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
-        ldmatrix<4>(B_rmem[mma_id_n][mma_id_k], addr);
+        addr += n * MMA_N * BLOCK_K * sizeof(TypeAB);
+        addr ^= k * MMA_K * sizeof(TypeAB);
+        ldmatrix<4>(B_rmem[n][k], addr);
       }
 
     // MMA
-    for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-      for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
-        for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++)
-          mma<TypeAB, TypeAB, TypeAcc>(A_rmem[mma_id_m][mma_id_k],
-                                       B_rmem[mma_id_n][mma_id_k],
-                                       C_rmem[mma_id_m][mma_id_n]);
+    for (int m = 0; m < WARP_M / MMA_M; m++)
+      for (int n = 0; n < WARP_N / MMA_N; n++)
+        for (int k = 0; k < BLOCK_K / MMA_K; k++)
+          mma<TypeAB, TypeAB, TypeAcc>(A_rmem[m][k], B_rmem[n][k], C_rmem[m][n]);
   };
 
   const int num_iters = cdiv(K, BLOCK_K);
@@ -167,12 +165,12 @@ void matmul_sm80_kernel(
   // wait for the last MMA to finish.
   __syncthreads();
 
-  for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-    for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++) {
-      const int row = mma_id_m * MMA_M + (lane_id / 4);
-      const int col = mma_id_n * MMA_N + (lane_id % 4) * 2;
+  for (int m = 0; m < WARP_M / MMA_M; m++)
+    for (int n = 0; n < WARP_N / MMA_N; n++) {
+      const int row = m * MMA_M + (lane_id / 4);
+      const int col = n * MMA_N + (lane_id % 4) * 2;
 
-      const int *acc = C_rmem[mma_id_m][mma_id_n];
+      const int *acc = C_rmem[m][n];
 
       if constexpr (cuda::std::is_same_v<TypeAcc, TypeC>) {
         // no conversion needed
