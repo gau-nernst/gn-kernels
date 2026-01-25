@@ -7,11 +7,11 @@ from torch import Tensor
 from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
 CURRENT_DIR = Path(__file__).parent
-KERNEL = open(CURRENT_DIR / "kernel.cu").read()
+KERNEL = open(CURRENT_DIR / "kernel_sm80.cu").read()
 
 
 @dataclasses.dataclass
-class AttnKernel:
+class AttnSm80Kernel:
     dtype: torch.dtype = torch.bfloat16
     qk_dim: int = 128
     v_dim: int = 128
@@ -29,7 +29,7 @@ class AttnKernel:
         self.smem_size = max(q_size, k_size + v_size) * self.dtype.itemsize
 
         template_args = [self.block_q, self.block_kv, self.num_warps, self.qk_dim, self.v_dim, _TYPE_MAP[self.dtype]]
-        kernel_name = f"attn_kernel<{', '.join(map(str, template_args))}>"
+        kernel_name = f"attn_sm80_kernel<{', '.join(map(str, template_args))}>"
         self.kernel = _compile_kernel(KERNEL, kernel_name, self.smem_size)
 
     def run(self, q: Tensor, k: Tensor, v: Tensor):

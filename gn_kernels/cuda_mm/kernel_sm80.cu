@@ -14,7 +14,7 @@ template <
 >
 __launch_bounds__(NUM_WARP_M * NUM_WARP_N * WARP_SIZE)
 __global__
-void matmul_kernel(
+void matmul_sm80_kernel(
   const TypeAB *A_gmem,
   const TypeAB *B_gmem,
         TypeC *C_gmem,

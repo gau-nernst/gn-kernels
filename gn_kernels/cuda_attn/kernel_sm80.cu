@@ -10,7 +10,7 @@ template <
 >
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
-void attn_kernel(
+void attn_sm80_kernel(
   const Type *Q_gmem,  // [bs, q_len, q_heads, QK_DIM]
   const Type *K_gmem,  // [bs, kv_len, kv_heads, QK_DIM]
   const Type *V_gmem,  // [bs, kv_len, kv_heads, V_DIM]
@@ -267,7 +267,7 @@ void attn_kernel(
         int addr = V_smem_thread;
         addr += mma_id_kv * MMA_K * V_DIM * sizeof(Type);  // row
         addr ^= mma_id_d * MMA_N * sizeof(Type);  // col
-        ldmatrix_trans<4>(V_rmem[mma_id_kv][mma_id_d], addr);
+        ldmatrix<4, TRANS>(V_rmem[mma_id_kv][mma_id_d], addr);
       }
 
     // MMA O += P @ V [BLOCK_Q, DIM]

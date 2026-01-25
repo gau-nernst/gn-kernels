@@ -7,11 +7,11 @@ from torch import Tensor
 from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
 CURRENT_DIR = Path(__file__).parent
-KERNEL = open(CURRENT_DIR / "kernel.cu").read()
+KERNEL = open(CURRENT_DIR / "kernel_sm80.cu").read()
 
 
 @dataclasses.dataclass
-class MatmulKernel:
+class MatmulSm80Kernel:
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = torch.bfloat16
     acc_dtype: torch.dtype = torch.float32
@@ -36,7 +36,7 @@ class MatmulKernel:
             _TYPE_MAP[self.out_dtype],
             _TYPE_MAP[self.acc_dtype],
         ]
-        kernel_name = f"matmul_kernel<{', '.join(map(str, template_args))}>"
+        kernel_name = f"matmul_sm80_kernel<{', '.join(map(str, template_args))}>"
         self.kernel = _compile_kernel(KERNEL, kernel_name, self.smem_size)
 
     def run(self, A: Tensor, B: Tensor):

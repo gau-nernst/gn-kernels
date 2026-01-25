@@ -2,3 +2,4 @@ pandas
 ipykernel
 pytest
 ruff
+tabulate

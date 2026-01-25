@@ -1,14 +1,14 @@
 import pytest
 import torch
 
-from gn_kernels.cuda_mm import MatmulKernel
+from gn_kernels.cuda_mm import MatmulSm80Kernel
 from gn_kernels.nvrtc_utils import int4x2, uint4x2
 
 
 @pytest.mark.parametrize("dtype_str", ["fp16", "bf16"])
 def test_cuda_mm_fp(dtype_str: str):
     dtype = dict(fp16=torch.float16, bf16=torch.bfloat16)[dtype_str]
-    kernel = MatmulKernel(dtype, dtype, torch.float32, num_stages=2)
+    kernel = MatmulSm80Kernel(dtype, dtype, torch.float32, num_stages=2)
 
     M, N, K = 512, 768, 1024
     A = torch.randn(M, K, dtype=dtype, device="cuda")
@@ -22,7 +22,7 @@ def test_cuda_mm_fp(dtype_str: str):
 
 
 def test_cuda_mm_int8():
-    kernel = MatmulKernel(torch.int8, torch.int32, torch.int32, num_stages=2)
+    kernel = MatmulSm80Kernel(torch.int8, torch.int32, torch.int32, num_stages=2)
 
     M, N, K = 512, 768, 1024
     A = torch.randint(-128, 127, (M, K), dtype=torch.int8, device="cuda")
@@ -37,7 +37,7 @@ def test_cuda_mm_int8():
 
 def test_cuda_mm_fp8():
     dtype = torch.float8_e4m3fn
-    kernel = MatmulKernel(dtype, torch.bfloat16, torch.float32, num_stages=2)
+    kernel = MatmulSm80Kernel(dtype, torch.bfloat16, torch.float32, num_stages=2)
 
     M, N, K = 512, 768, 1024
     A = torch.randn(M, K, device="cuda").to(dtype)
@@ -54,7 +54,7 @@ def test_cuda_mm_fp8():
 @pytest.mark.parametrize("dtype_str", ["fp16", "fp8"])
 def test_cuda_mm_fp16_acc(dtype_str: str):
     dtype = dict(fp16=torch.float16, fp8=torch.float8_e4m3fn)[dtype_str]
-    kernel = MatmulKernel(dtype, torch.float16, torch.float16, num_stages=2)
+    kernel = MatmulSm80Kernel(dtype, torch.float16, torch.float16, num_stages=2)
 
     M, N, K = 512, 768, 1024
     A = torch.randn(M, K, device="cuda").to(dtype)
@@ -81,7 +81,7 @@ def test_cuda_mm_int4(dtype_str: str):
         int4=(int4x2, -8, 7),
         uint4=(uint4x2, 0, 15),
     )[dtype_str]
-    kernel = MatmulKernel(dtype, torch.int32, torch.int32, num_stages=2)
+    kernel = MatmulSm80Kernel(dtype, torch.int32, torch.int32, num_stages=2)
 
     def pack_int4(x: torch.Tensor):
         return (x[:, 1::2] << 4) | (x[:, ::2] & 0xF)

@@ -304,7 +304,7 @@ void sm120a_attn_mxfp8_qk_kernel(
         int addr = V_smem_thread;
         addr += mma_id_kv * MMA_K_BF16 * DIM * sizeof(TypeV);  // row
         addr ^= mma_id_d * MMA_N * sizeof(TypeV);  // col
-        ldmatrix_trans<4>(V_rmem[mma_id_kv][mma_id_d], addr);
+        ldmatrix<4, TRANS>(V_rmem[mma_id_kv][mma_id_d], addr);
       }
 
     // MMA P = S @ V [BLOCK_Q, DIM]
