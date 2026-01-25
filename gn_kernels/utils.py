@@ -1,3 +1,5 @@
+import statistics
+
 import torch
 import triton
 import triton.language as tl
@@ -228,3 +230,30 @@ def quantize_nvfp4_triton(x: Tensor, tensor_scale: Tensor):
     quantize_nvfp4_triton_kernel[grid](x, tensor_scale, xq, scales, x.stride(0), x.stride(1), N)
 
     return xq.view(FP4_DTYPE), scales
+
+
+def do_bench(f, num: int, num_warmup: int = 10):
+    start_list = [torch.cuda.Event(enable_timing=True) for _ in range(num)]
+    end_list = [torch.cuda.Event(enable_timing=True) for _ in range(num)]
+
+    A = torch.randn(1024, 1024, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(1024, 1024, dtype=torch.bfloat16, device="cuda")
+
+    l2_size = torch.cuda.get_device_properties().L2_cache_size
+    buf = torch.empty(l2_size * 2, dtype=torch.uint8, device="cuda")
+
+    # warmup
+    for _ in range(num_warmup):
+        f()
+
+    for start, end in zip(start_list, end_list):
+        buf.zero_()  # clear L2 cache
+        A @ B  # queue a slow job
+
+        start.record()
+        f()
+        end.record()
+
+    torch.cuda.synchronize()
+    timings = [start.elapsed_time(end) for start, end in zip(start_list, end_list)]
+    return statistics.mean(timings), statistics.stdev(timings)
