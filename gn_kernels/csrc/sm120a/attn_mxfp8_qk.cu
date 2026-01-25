@@ -91,25 +91,9 @@ void sm120a_attn_mxfp8_qk_kernel(
   float O_rmem[WARP_Q / MMA_M][DIM / MMA_N][4] = {};
 
   // pre-compute address and swizzling for ldmatrix
-  int Q_smem_thread, K_smem_thread, V_smem_thread;
-  {
-    // A tile
-    const int row = warp_id * WARP_Q + (lane_id % 16);
-    const int col = (lane_id / 16) * (16 / sizeof(TypeQK));
-    Q_smem_thread = swizzle<DIM * sizeof(TypeQK)>(Q_smem + (row * DIM + col) * sizeof(TypeQK));
-  }
-  {
-    // B tile
-    const int row = lane_id % 8;
-    const int col = (lane_id / 8) * (16 / sizeof(TypeQK));
-    K_smem_thread = swizzle<DIM * sizeof(TypeQK)>(K_smem + (row * DIM + col) * sizeof(TypeQK));
-  }
-  {
-    // B tile trans
-    const int row = lane_id % 16;
-    const int col = (lane_id / 16) * 8;
-    V_smem_thread = swizzle<DIM * sizeof(TypeV)>(V_smem + (row * DIM + col) * sizeof(TypeV));
-  }
+  const int Q_smem_thread = Q_smem + swizzle<DIM * sizeof(TypeQK)>(warp_id * WARP_Q + (lane_id % 16), lane_id / 16);  // A tile
+  const int K_smem_thread = K_smem + swizzle<DIM * sizeof(TypeQK)>(lane_id % 8, lane_id / 8);  // B tile
+  const int V_smem_thread = V_smem + swizzle<DIM * sizeof(TypeV)>(lane_id % 16, lane_id / 16);  // B tile trans
 
   // NOTE (again): for MXFP8 scales, we repack [32,4] = [4,8,4] -> [8,4,4] (128 elements)
   const int scale_K_smem_thread = scale_K_smem + lane_id * 16;
@@ -126,8 +110,8 @@ void sm120a_attn_mxfp8_qk_kernel(
   }
 
   // load Q [BLOCK_Q, DIM]
-  global_to_shared_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
-  global_to_shared_swizzle<BLOCK_Q / 4, DIM / 8, TB_SIZE>(scale_Q_smem, scale_Q, DIM / 8, tid);
+  cp_async_g2s_swizzle<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
+  cp_async_g2s_swizzle<BLOCK_Q / 4, DIM / 8, TB_SIZE>(scale_Q_smem, scale_Q, DIM / 8, tid);
   asm volatile("cp.async.commit_group;");
   asm volatile("cp.async.wait_all;");
   __syncthreads();
@@ -165,8 +149,8 @@ void sm120a_attn_mxfp8_qk_kernel(
       // double buffer for K
       const int K_dst = K_smem + (kv_id % 2) * (BLOCK_KV * DIM * sizeof(TypeQK));
       const int scale_K_dst = scale_K_smem + (kv_id % 2) * (BLOCK_KV * (DIM / 32) * sizeof(TypeScale));
-      global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_dst, K, DIM, tid);
-      global_to_shared_swizzle<BLOCK_KV / 4, DIM / 8, TB_SIZE>(scale_K_dst, scale_K, DIM / 8, tid);
+      cp_async_g2s_swizzle<BLOCK_KV, DIM, TB_SIZE>(K_dst, K, DIM, tid);
+      cp_async_g2s_swizzle<BLOCK_KV / 4, DIM / 8, TB_SIZE>(scale_K_dst, scale_K, DIM / 8, tid);
       K += BLOCK_KV * DIM;
       scale_K += (BLOCK_KV / 4) * (DIM / 8);
     }
@@ -174,7 +158,7 @@ void sm120a_attn_mxfp8_qk_kernel(
   };
   auto load_V = [&](int kv_id) {
     // single buffer for V
-    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_smem, V, DIM, tid);
+    cp_async_g2s_swizzle<BLOCK_KV, DIM, TB_SIZE>(V_smem, V, DIM, tid);
     V += BLOCK_KV * DIM;
     asm volatile("cp.async.commit_group;");
   };

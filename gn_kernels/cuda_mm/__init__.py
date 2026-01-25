@@ -15,10 +15,10 @@ class MatmulSm80Kernel:
     in_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = torch.bfloat16
     acc_dtype: torch.dtype = torch.float32
-    block_mnk: tuple[int, int, int] = (128, 128, 64)
+    block_mnk: tuple[int, int, int] = (128, 64, 64)
     group_m: int = 8
     warp_mn: tuple[int, int] = (2, 2)
-    num_stages: int = 1
+    num_stages: int = 2
 
     def __post_init__(self) -> None:
         self.tb_size = (self.warp_mn[0] * self.warp_mn[1] * 32, 1, 1)

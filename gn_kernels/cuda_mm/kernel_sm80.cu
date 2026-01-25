@@ -40,10 +40,17 @@ void matmul_sm80_kernel(
   const int grid_n = cdiv(N, BLOCK_N);
 
   int bid_m, bid_n;
-  if constexpr (GROUP_M == 1) {
+  if constexpr (GROUP_M == 0) {
+    // column-major
+    bid_m = bid % grid_m;
+    bid_n = bid / grid_m;
+  }
+  else if constexpr (GROUP_M == 1) {
+    // row-major
     bid_m = bid / grid_n;
     bid_n = bid % grid_n;
-  } else {
+  }
+  else {
     // threadblock swizzling, from triton
     // improve L2 reuse when M is large.
     const int group_size = GROUP_M * grid_n;
@@ -66,7 +73,7 @@ void matmul_sm80_kernel(
   extern __shared__ char smem[];
   const int A_smem = static_cast<int>(__cvta_generic_to_shared(smem));
   const int B_smem = A_smem + BLOCK_M * BLOCK_K * sizeof(TypeAB);
-  constexpr int BUFFER_SIZE = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(TypeAB);
+  constexpr int STAGE_SIZE = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(TypeAB);
 
   // set up register memory
   int A_rmem[WARP_M / MMA_M][BLOCK_K / MMA_K][4];
@@ -76,28 +83,28 @@ void matmul_sm80_kernel(
   // pre-compute ldmatrix address and swizzling
   int A_smem_thread, B_smem_thread;
   {
-    const int m = (warp_id_m * WARP_M) + (lane_id % 16);
-    const int k = (lane_id / 16) * 16;  // 16-byte
-    A_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(A_smem + (m * BLOCK_K * sizeof(TypeAB)) + k);
+    const int row = warp_id_m * WARP_M + (lane_id % 16);
+    const int col = lane_id / 16;  // 16-byte word
+    A_smem_thread = A_smem + swizzle<BLOCK_K * sizeof(TypeAB)>(row, col);
   }
   {
-    const int n = (warp_id_n * WARP_N) + (lane_id % 8);
-    const int k = (lane_id / 8) * 16;
-    B_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(B_smem + (n * BLOCK_K * sizeof(TypeAB)) + k);
+    const int row = warp_id_n * WARP_N + (lane_id % 8);
+    const int col = lane_id / 8;
+    B_smem_thread = B_smem + swizzle<BLOCK_K * sizeof(TypeAB)>(row, col);
   }
 
   const int num_k_iters = cdiv(K, BLOCK_K);
   auto load_AB = [&](int iter_k) {
     // select smem buffer
     if (iter_k < num_k_iters) {
-        const int this_A_smem = A_smem + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        const int this_B_smem = B_smem + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        global_to_shared_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
-        global_to_shared_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
+        const int this_A_smem = A_smem + (iter_k % NUM_STAGES) * STAGE_SIZE;
+        const int this_B_smem = B_smem + (iter_k % NUM_STAGES) * STAGE_SIZE;
+        cp_async_g2s_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
+        cp_async_g2s_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
         A_gmem += BLOCK_K;
         B_gmem += BLOCK_K;
     }
-    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.commit_group;");
   };
 
   // initiate prefetching
@@ -115,7 +122,7 @@ void matmul_sm80_kernel(
 
     for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
       for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++) {
-        int addr = A_smem_thread + (iter_k % NUM_STAGES) * BUFFER_SIZE;
+        int addr = A_smem_thread + (iter_k % NUM_STAGES) * STAGE_SIZE;
         addr += mma_id_m * MMA_M * BLOCK_K * sizeof(TypeAB);
         addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
         ldmatrix<4>(A_rmem[mma_id_m][mma_id_k], addr);
@@ -123,7 +130,7 @@ void matmul_sm80_kernel(
 
     for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
       for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k += 2) {
-        int addr = B_smem_thread + (iter_k % NUM_STAGES) * BUFFER_SIZE;
+        int addr = B_smem_thread + (iter_k % NUM_STAGES) * STAGE_SIZE;
         addr += mma_id_n * MMA_N * BLOCK_K * sizeof(TypeAB);
         addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
         ldmatrix<4>(B_rmem[mma_id_n][mma_id_k], addr);
