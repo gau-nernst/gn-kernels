@@ -93,44 +93,31 @@ void matmul_sm80_kernel(
     B_smem_thread = B_smem + swizzle<BLOCK_K * sizeof(TypeAB)>(row, col);
   }
 
-  const int num_k_iters = cdiv(K, BLOCK_K);
-  auto load_AB = [&](int iter_k) {
+  auto load = [&](int stage_id) {
     // select smem buffer
-    if (iter_k < num_k_iters) {
-        const int this_A_smem = A_smem + (iter_k % NUM_STAGES) * STAGE_SIZE;
-        const int this_B_smem = B_smem + (iter_k % NUM_STAGES) * STAGE_SIZE;
-        cp_async_g2s_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
-        cp_async_g2s_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
-        A_gmem += BLOCK_K;
-        B_gmem += BLOCK_K;
-    }
+    const int this_A_smem = A_smem + stage_id * STAGE_SIZE;
+    const int this_B_smem = B_smem + stage_id * STAGE_SIZE;
+    cp_async_g2s_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
+    cp_async_g2s_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
+    A_gmem += BLOCK_K;
+    B_gmem += BLOCK_K;
     asm volatile("cp.async.commit_group;");
   };
 
-  // initiate prefetching
-  for (int i = 0; i < NUM_STAGES - 1; i++)
-    load_AB(i);
-
-  for (int iter_k = 0; iter_k < num_k_iters; iter_k++) {
-    // prefetch the next tile. wait for previous MMA to finish
-    __syncthreads();
-    load_AB(iter_k + NUM_STAGES - 1);
-
-    // load smem->rmem
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(NUM_STAGES - 1));
-    __syncthreads();
-
+  auto compute = [&](int stage_id) {
+    // A smem->rmem
     for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
       for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++) {
-        int addr = A_smem_thread + (iter_k % NUM_STAGES) * STAGE_SIZE;
+        int addr = A_smem_thread + stage_id * STAGE_SIZE;
         addr += mma_id_m * MMA_M * BLOCK_K * sizeof(TypeAB);
         addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
         ldmatrix<4>(A_rmem[mma_id_m][mma_id_k], addr);
       }
 
+    // B smem->rmem
     for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
       for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k += 2) {
-        int addr = B_smem_thread + (iter_k % NUM_STAGES) * STAGE_SIZE;
+        int addr = B_smem_thread + stage_id * STAGE_SIZE;
         addr += mma_id_n * MMA_N * BLOCK_K * sizeof(TypeAB);
         addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
         ldmatrix<4>(B_rmem[mma_id_n][mma_id_k], addr);
@@ -143,10 +130,43 @@ void matmul_sm80_kernel(
           mma<TypeAB, TypeAB, TypeAcc>(A_rmem[mma_id_m][mma_id_k],
                                        B_rmem[mma_id_n][mma_id_k],
                                        C_rmem[mma_id_m][mma_id_n]);
+  };
+
+  const int num_iters = cdiv(K, BLOCK_K);
+  const int mainloop_iters = num_iters - NUM_STAGES + 1;
+
+  // initiate prefetching
+  for (int i = 0; i < NUM_STAGES - 1; i++)
+    load(i);
+
+  // mainloop
+  for (int iter_k = 0; iter_k < mainloop_iters; iter_k++) {
+    // prefetch the next tile
+    // wait for previous MMA to finish
+    __syncthreads();
+    load((iter_k + NUM_STAGES - 1) % NUM_STAGES);
+
+    // wait for the corresponding cp.async load to finish
+    asm volatile("cp.async.wait_group %0;" :: "n"(NUM_STAGES - 1));
+    __syncthreads();
+    compute(iter_k % NUM_STAGES);
   }
 
-  // write results to gmem. wait for the last MMA to finish.
+  // last few k-tiles: don't need to prefetch
+  for (int iter_k = mainloop_iters; iter_k < num_iters; iter_k++) {
+    // commit empty group so that we have invariance of NUM_STAGES cp.async stages in-flight
+    asm volatile("cp.async.commit_group;");
+
+    // still need to wait for cp.async
+    asm volatile("cp.async.wait_group %0;" :: "n"(NUM_STAGES - 1));
+    __syncthreads();
+    compute(iter_k % NUM_STAGES);
+  }
+
+  // epilogue
+  // wait for the last MMA to finish.
   __syncthreads();
+
   for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
     for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++) {
       const int row = mma_id_m * MMA_M + (lane_id / 4);

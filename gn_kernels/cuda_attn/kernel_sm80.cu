@@ -140,7 +140,7 @@ void attn_sm80_kernel(
     load_V(kv_id);
 
     // K smem->rmem
-    asm volatile("cp.async.wait_group 1;\n");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < QK_DIM / MMA_K; mma_id_d += 2) {
@@ -247,7 +247,7 @@ void attn_sm80_kernel(
     }
 
     // V smem->rmem
-    asm volatile("cp.async.wait_group 1;\n");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
     for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
       for (int mma_id_d = 0; mma_id_d < V_DIM / MMA_N; mma_id_d += 2) {
