@@ -14,7 +14,7 @@ template <
 >
 __launch_bounds__(NUM_WARP_M * NUM_WARP_N * WARP_SIZE)
 __global__
-void matmul_kernel(
+void matmul_sm80_kernel(
   const TypeAB *A_gmem,
   const TypeAB *B_gmem,
         TypeC *C_gmem,
@@ -23,6 +23,9 @@ void matmul_kernel(
   constexpr int WARP_M = BLOCK_M / NUM_WARP_M;
   constexpr int WARP_N = BLOCK_N / NUM_WARP_N;
   constexpr int TB_SIZE = NUM_WARP_M * NUM_WARP_N * WARP_SIZE;
+
+  constexpr int MMA_M = SM80::MMA_M;
+  constexpr int MMA_N = SM80::MMA_N;
   constexpr int MMA_K = 32 / sizeof(TypeAB);
 
   const int tid = threadIdx.x;
@@ -37,10 +40,17 @@ void matmul_kernel(
   const int grid_n = cdiv(N, BLOCK_N);
 
   int bid_m, bid_n;
-  if constexpr (GROUP_M == 1) {
+  if constexpr (GROUP_M == 0) {
+    // column-major
+    bid_m = bid % grid_m;
+    bid_n = bid / grid_m;
+  }
+  else if constexpr (GROUP_M == 1) {
+    // row-major
     bid_m = bid / grid_n;
     bid_n = bid % grid_n;
-  } else {
+  }
+  else {
     // threadblock swizzling, from triton
     // improve L2 reuse when M is large.
     const int group_size = GROUP_M * grid_n;
@@ -63,7 +73,7 @@ void matmul_kernel(
   extern __shared__ char smem[];
   const int A_smem = static_cast<int>(__cvta_generic_to_shared(smem));
   const int B_smem = A_smem + BLOCK_M * BLOCK_K * sizeof(TypeAB);
-  constexpr int BUFFER_SIZE = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(TypeAB);
+  constexpr int STAGE_SIZE = (BLOCK_M + BLOCK_N) * BLOCK_K * sizeof(TypeAB);
 
   // set up register memory
   int A_rmem[WARP_M / MMA_M][BLOCK_K / MMA_K][4];
@@ -73,76 +83,94 @@ void matmul_kernel(
   // pre-compute ldmatrix address and swizzling
   int A_smem_thread, B_smem_thread;
   {
-    const int m = (warp_id_m * WARP_M) + (lane_id % 16);
-    const int k = (lane_id / 16) * 16;  // 16-byte
-    A_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(A_smem + (m * BLOCK_K * sizeof(TypeAB)) + k);
+    const int row = warp_id_m * WARP_M + (lane_id % 16);
+    const int col = lane_id / 16;  // 16-byte word
+    A_smem_thread = A_smem + swizzle<BLOCK_K * sizeof(TypeAB)>(row, col);
   }
   {
-    const int n = (warp_id_n * WARP_N) + (lane_id % 8);
-    const int k = (lane_id / 8) * 16;
-    B_smem_thread = swizzle<BLOCK_K * sizeof(TypeAB)>(B_smem + (n * BLOCK_K * sizeof(TypeAB)) + k);
+    const int row = warp_id_n * WARP_N + (lane_id % 8);
+    const int col = lane_id / 8;
+    B_smem_thread = B_smem + swizzle<BLOCK_K * sizeof(TypeAB)>(row, col);
   }
 
-  const int num_k_iters = cdiv(K, BLOCK_K);
-  auto load_AB = [&](int iter_k) {
+  auto load = [&](int stage_id) {
     // select smem buffer
-    if (iter_k < num_k_iters) {
-        const int this_A_smem = A_smem + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        const int this_B_smem = B_smem + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        global_to_shared_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
-        global_to_shared_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
-        A_gmem += BLOCK_K;
-        B_gmem += BLOCK_K;
-    }
-    asm volatile("cp.async.commit_group;\n");
+    const int this_A_smem = A_smem + stage_id * STAGE_SIZE;
+    const int this_B_smem = B_smem + stage_id * STAGE_SIZE;
+    cp_async_g2s_swizzle<BLOCK_M, BLOCK_K, TB_SIZE>(this_A_smem, A_gmem, K, tid);
+    cp_async_g2s_swizzle<BLOCK_N, BLOCK_K, TB_SIZE>(this_B_smem, B_gmem, K, tid);
+    A_gmem += BLOCK_K;
+    B_gmem += BLOCK_K;
+    asm volatile("cp.async.commit_group;");
   };
 
-  // initiate prefetching
-  for (int i = 0; i < NUM_STAGES - 1; i++)
-    load_AB(i);
-
-  for (int iter_k = 0; iter_k < num_k_iters; iter_k++) {
-    // prefetch the next tile. wait for previous MMA to finish
-    __syncthreads();
-    load_AB(iter_k + NUM_STAGES - 1);
-
-    // load smem->rmem
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(NUM_STAGES - 1));
-    __syncthreads();
-
-    for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-      for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++) {
-        int addr = A_smem_thread + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        addr += mma_id_m * MMA_M * BLOCK_K * sizeof(TypeAB);
-        addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
-        ldmatrix<4>(A_rmem[mma_id_m][mma_id_k], addr);
+  auto compute = [&](int stage_id) {
+    // A smem->rmem
+    for (int m = 0; m < WARP_M / MMA_M; m++)
+      for (int k = 0; k < BLOCK_K / MMA_K; k++) {
+        int addr = A_smem_thread + stage_id * STAGE_SIZE;
+        addr += m * MMA_M * BLOCK_K * sizeof(TypeAB);
+        addr ^= k * MMA_K * sizeof(TypeAB);
+        ldmatrix<4>(A_rmem[m][k], addr);
       }
 
-    for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
-      for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k += 2) {
-        int addr = B_smem_thread + (iter_k % NUM_STAGES) * BUFFER_SIZE;
-        addr += mma_id_n * MMA_N * BLOCK_K * sizeof(TypeAB);
-        addr ^= mma_id_k * MMA_K * sizeof(TypeAB);
-        ldmatrix<4>(B_rmem[mma_id_n][mma_id_k], addr);
+    // B smem->rmem
+    for (int n = 0; n < WARP_N / MMA_N; n++)
+      for (int k = 0; k < BLOCK_K / MMA_K; k += 2) {
+        int addr = B_smem_thread + stage_id * STAGE_SIZE;
+        addr += n * MMA_N * BLOCK_K * sizeof(TypeAB);
+        addr ^= k * MMA_K * sizeof(TypeAB);
+        ldmatrix<4>(B_rmem[n][k], addr);
       }
 
     // MMA
-    for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-      for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++)
-        for (int mma_id_k = 0; mma_id_k < BLOCK_K / MMA_K; mma_id_k++)
-          mma<TypeAB, TypeAB, TypeAcc>(A_rmem[mma_id_m][mma_id_k],
-                                       B_rmem[mma_id_n][mma_id_k],
-                                       C_rmem[mma_id_m][mma_id_n]);
+    for (int m = 0; m < WARP_M / MMA_M; m++)
+      for (int n = 0; n < WARP_N / MMA_N; n++)
+        for (int k = 0; k < BLOCK_K / MMA_K; k++)
+          mma<TypeAB, TypeAB, TypeAcc>(A_rmem[m][k], B_rmem[n][k], C_rmem[m][n]);
+  };
+
+  const int num_iters = cdiv(K, BLOCK_K);
+  const int mainloop_iters = num_iters - NUM_STAGES + 1;
+
+  // initiate prefetching
+  for (int i = 0; i < NUM_STAGES - 1; i++)
+    load(i);
+
+  // mainloop
+  for (int iter_k = 0; iter_k < mainloop_iters; iter_k++) {
+    // prefetch the next tile
+    // wait for previous MMA to finish
+    __syncthreads();
+    load((iter_k + NUM_STAGES - 1) % NUM_STAGES);
+
+    // wait for the corresponding cp.async load to finish
+    asm volatile("cp.async.wait_group %0;" :: "n"(NUM_STAGES - 1));
+    __syncthreads();
+    compute(iter_k % NUM_STAGES);
   }
 
-  // write results to gmem. wait for the last MMA to finish.
-  __syncthreads();
-  for (int mma_id_m = 0; mma_id_m < WARP_M / MMA_M; mma_id_m++)
-    for (int mma_id_n = 0; mma_id_n < WARP_N / MMA_N; mma_id_n++) {
-      const int row = mma_id_m * MMA_M + (lane_id / 4);
-      const int col = mma_id_n * MMA_N + (lane_id % 4) * 2;
+  // last few k-tiles: don't need to prefetch
+  for (int iter_k = mainloop_iters; iter_k < num_iters; iter_k++) {
+    // commit empty group so that we have invariance of NUM_STAGES cp.async stages in-flight
+    asm volatile("cp.async.commit_group;");
 
-      const int *acc = C_rmem[mma_id_m][mma_id_n];
+    // still need to wait for cp.async
+    asm volatile("cp.async.wait_group %0;" :: "n"(NUM_STAGES - 1));
+    __syncthreads();
+    compute(iter_k % NUM_STAGES);
+  }
+
+  // epilogue
+  // wait for the last MMA to finish.
+  __syncthreads();
+
+  for (int m = 0; m < WARP_M / MMA_M; m++)
+    for (int n = 0; n < WARP_N / MMA_N; n++) {
+      const int row = m * MMA_M + (lane_id / 4);
+      const int col = n * MMA_N + (lane_id % 4) * 2;
+
+      const int *acc = C_rmem[m][n];
 
       if constexpr (cuda::std::is_same_v<TypeAcc, TypeC>) {
         // no conversion needed

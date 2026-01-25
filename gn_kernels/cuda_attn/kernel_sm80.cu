@@ -10,7 +10,7 @@ template <
 >
 __launch_bounds__(NUM_WARPS * WARP_SIZE)
 __global__
-void attn_kernel(
+void attn_sm80_kernel(
   const Type *Q_gmem,  // [bs, q_len, q_heads, QK_DIM]
   const Type *K_gmem,  // [bs, kv_len, kv_heads, QK_DIM]
   const Type *V_gmem,  // [bs, kv_len, kv_heads, V_DIM]
@@ -47,6 +47,8 @@ void attn_kernel(
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
 
   // m16n8k16
+  constexpr int MMA_M = SM80::MMA_M;
+  constexpr int MMA_N = SM80::MMA_N;
   constexpr int MMA_K = 16;
 
   const int q_offset = q_block_id * BLOCK_Q;
@@ -64,25 +66,10 @@ void attn_kernel(
   const int V_smem = K_smem + 2 * BLOCK_KV * QK_DIM * sizeof(Type);
 
   // pre-compute address and swizzling for ldmatrix
-  int Q_smem_thread, K_smem_thread, V_smem_thread;
-  {
-    // A tile
-    const int row = warp_id * WARP_Q + (lane_id % 16);
-    const int col = (lane_id / 16) * 16;
-    Q_smem_thread = swizzle<QK_DIM * sizeof(Type)>(Q_smem + (row * QK_DIM * sizeof(Type) + col));
-  }
-  {
-    // B tile
-    const int row = lane_id % 8;
-    const int col = (lane_id / 8) * 16;
-    K_smem_thread = swizzle<QK_DIM * sizeof(Type)>(K_smem + (row * QK_DIM * sizeof(Type) + col));
-  }
-  {
-    // B tile trans
-    const int row = lane_id % 16;
-    const int col = (lane_id / 16) * 16;
-    V_smem_thread = swizzle<QK_DIM * sizeof(Type)>(V_smem + (row * V_DIM * sizeof(Type) + col));
-  }
+  //   swizzle<STRIDE in bytes>(row, col in 16-byte unit)
+  const int Q_smem_thread = Q_smem + swizzle<QK_DIM * sizeof(Type)>(warp_id * WARP_Q + (lane_id % 16), lane_id / 16);  // A tile
+  const int K_smem_thread = K_smem + swizzle<QK_DIM * sizeof(Type)>(lane_id % 8, lane_id / 8);  // B tile
+  const int V_smem_thread = V_smem + swizzle<QK_DIM * sizeof(Type)>(lane_id % 16, lane_id / 16);  // B tile trans
 
   // set up registers
   int Q_rmem[WARP_Q / MMA_M][QK_DIM / MMA_K][4];
@@ -104,24 +91,24 @@ void attn_kernel(
   float rowmax[WARP_Q / MMA_M][2];
   float rowsumexp[WARP_Q / MMA_M][2] = {};
 
-  for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
-    rowmax[mma_id_q][0] = -3.4e38;  // ~FLT_MAX
-    rowmax[mma_id_q][1] = -3.4e38;
+  for (int q = 0; q < WARP_Q / MMA_M; q++) {
+    rowmax[q][0] = -3.4e38;  // ~FLT_MAX
+    rowmax[q][1] = -3.4e38;
   }
 
   // Q gmem->smem
-  global_to_shared_swizzle<BLOCK_Q, QK_DIM, TB_SIZE>(Q_smem, Q_gmem, Q_s1, tid);
+  cp_async_g2s_swizzle<BLOCK_Q, QK_DIM, TB_SIZE>(Q_smem, Q_gmem, Q_s1, tid);
   asm volatile("cp.async.commit_group;\n");
 
   // Q smem->rmem
   asm volatile("cp.async.wait_all;\n");
   __syncthreads();
-  for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-    for (int mma_id_d = 0; mma_id_d < QK_DIM / MMA_K; mma_id_d++) {
+  for (int q = 0; q < WARP_Q / MMA_M; q++)
+    for (int d = 0; d < QK_DIM / MMA_K; d++) {
       int addr = Q_smem_thread;
-      addr += mma_id_q * MMA_M * QK_DIM * sizeof(Type);  // row
-      addr ^= mma_id_d * MMA_K * sizeof(Type);  // col
-      ldmatrix<4>(Q_rmem[mma_id_q][mma_id_d], addr);
+      addr += q * MMA_M * QK_DIM * sizeof(Type);  // row
+      addr ^= d * MMA_K * sizeof(Type);  // col
+      ldmatrix<4>(Q_rmem[q][d], addr);
     }
 
   const int num_kv_iter = cdiv(kv_len, BLOCK_KV);
@@ -130,13 +117,13 @@ void attn_kernel(
   auto load_K = [&](int kv_id) {
     if (kv_id < num_kv_iter) {
       const int dst = K_smem + (kv_id % 2) * (BLOCK_KV * QK_DIM) * sizeof(Type);
-      global_to_shared_swizzle<BLOCK_KV, QK_DIM, TB_SIZE>(dst, K_gmem, K_s1, tid);
+      cp_async_g2s_swizzle<BLOCK_KV, QK_DIM, TB_SIZE>(dst, K_gmem, K_s1, tid);
       K_gmem += BLOCK_KV * K_s1;
     }
     asm volatile("cp.async.commit_group;\n");
   };
   auto load_V = [&](int kv_id) {
-    global_to_shared_swizzle<BLOCK_KV, V_DIM, TB_SIZE>(V_smem, V_gmem, V_s1, tid);
+    cp_async_g2s_swizzle<BLOCK_KV, V_DIM, TB_SIZE>(V_smem, V_gmem, V_s1, tid);
     V_gmem += BLOCK_KV * V_s1;
     asm volatile("cp.async.commit_group;\n");
   };
@@ -153,46 +140,44 @@ void attn_kernel(
     load_V(kv_id);
 
     // K smem->rmem
-    asm volatile("cp.async.wait_group 1;\n");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
-    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
-      for (int mma_id_d = 0; mma_id_d < QK_DIM / MMA_K; mma_id_d += 2) {
+    for (int kv = 0; kv < BLOCK_KV / MMA_N; kv++)
+      for (int d = 0; d < QK_DIM / MMA_K; d += 2) {
         int addr = K_smem_thread + (kv_id % 2) * (BLOCK_KV * QK_DIM) * sizeof(Type);
-        addr += mma_id_kv * MMA_N * QK_DIM * sizeof(Type);  // row
-        addr ^= mma_id_d * MMA_K * sizeof(Type);  // col
-        ldmatrix<4>(K_rmem[mma_id_kv][mma_id_d], addr);
+        addr += kv * MMA_N * QK_DIM * sizeof(Type);  // row
+        addr ^= d * MMA_K * sizeof(Type);  // col
+        ldmatrix<4>(K_rmem[kv][d], addr);
       }
 
     // MMA S = Q @ K.T [BLOCK_Q, BLOCK_KV]
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
-        for (int mma_id_d = 0; mma_id_d < QK_DIM / MMA_K; mma_id_d++)
-          mma<Type, Type, float>(Q_rmem[mma_id_q][mma_id_d],
-                                 K_rmem[mma_id_kv][mma_id_d],
-                                 S_rmem[mma_id_q][mma_id_kv]);
+    for (int q = 0; q < WARP_Q / MMA_M; q++)
+      for (int kv = 0; kv < BLOCK_KV / MMA_N; kv++)
+        for (int d = 0; d < QK_DIM / MMA_K; d++)
+          mma<Type, Type, float>(Q_rmem[q][d], K_rmem[kv][d], S_rmem[q][kv]);
 
     // prefetch K
     // do we need sync here?
     load_K(kv_id + 1);
 
     // softmax
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+    for (int q = 0; q < WARP_Q / MMA_M; q++) {
       // apply softmax scale
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+      for (int kv = 0; kv < BLOCK_KV / MMA_N; kv++)
         for (int reg_id = 0; reg_id < 4; reg_id++)
-          S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
+          S_rmem[q][kv][reg_id] *= softmax_scale;
 
       // rowmax
       float this_rowmax[2];
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        float *regs = S_rmem[mma_id_q][mma_id_kv];
-        if (mma_id_kv == 0) {
-          this_rowmax[0] = max(regs[0], regs[1]);
-          this_rowmax[1] = max(regs[2], regs[3]);
-        } else {
-          this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
-          this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
-        }
+
+      // unroll 1st iteration
+      this_rowmax[0] = max(S_rmem[q][0][0], S_rmem[q][0][1]);
+      this_rowmax[1] = max(S_rmem[q][0][2], S_rmem[q][0][3]);
+
+      for (int kv = 1; kv < BLOCK_KV / MMA_N; kv++) {
+        float *regs = S_rmem[q][kv];
+        this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
+        this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
       }
 
       // butterfly reduction within 4 threads
@@ -202,34 +187,34 @@ void attn_kernel(
       this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 2));
 
       // new rowmax
-      this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
-      this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
+      this_rowmax[0] = max(this_rowmax[0], rowmax[q][0]);
+      this_rowmax[1] = max(this_rowmax[1], rowmax[q][1]);
 
       // rescale for previous O
       float rescale[2];
-      rescale[0] = exp2f(rowmax[mma_id_q][0] - this_rowmax[0]);
-      rescale[1] = exp2f(rowmax[mma_id_q][1] - this_rowmax[1]);
-      for (int mma_id_d = 0; mma_id_d < V_DIM / MMA_N; mma_id_d++) {
-        O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
-        O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
-        O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
-        O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+      rescale[0] = exp2f(rowmax[q][0] - this_rowmax[0]);
+      rescale[1] = exp2f(rowmax[q][1] - this_rowmax[1]);
+      for (int d = 0; d < V_DIM / MMA_N; d++) {
+        O_rmem[q][d][0] *= rescale[0];
+        O_rmem[q][d][1] *= rescale[0];
+        O_rmem[q][d][2] *= rescale[1];
+        O_rmem[q][d][3] *= rescale[1];
       }
 
       // save new rowmax
-      rowmax[mma_id_q][0] = this_rowmax[0];
-      rowmax[mma_id_q][1] = this_rowmax[1];
+      rowmax[q][0] = this_rowmax[0];
+      rowmax[q][1] = this_rowmax[1];
 
       // rowsumexp
       float this_rowsumexp[2];
-      for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-        float *regs = S_rmem[mma_id_q][mma_id_kv];
-        float c0 = exp2f(regs[0] - rowmax[mma_id_q][0]);
-        float c1 = exp2f(regs[1] - rowmax[mma_id_q][0]);
-        float c2 = exp2f(regs[2] - rowmax[mma_id_q][1]);
-        float c3 = exp2f(regs[3] - rowmax[mma_id_q][1]);
+      for (int kv = 0; kv < BLOCK_KV / MMA_N; kv++) {
+        float *regs = S_rmem[q][kv];
+        float c0 = exp2f(regs[0] - rowmax[q][0]);
+        float c1 = exp2f(regs[1] - rowmax[q][0]);
+        float c2 = exp2f(regs[2] - rowmax[q][1]);
+        float c3 = exp2f(regs[3] - rowmax[q][1]);
 
-        if (mma_id_kv == 0) {
+        if (kv == 0) {
           this_rowsumexp[0] = c0 + c1;
           this_rowsumexp[1] = c2 + c3;
         } else {
@@ -242,8 +227,8 @@ void attn_kernel(
         // equivalent to __float22bfloat162_rn() / __float22half2_rn()
         asm volatile("cvt.rn.satfinite.%6x2.f32 %0, %2, %3;\n"
                      "cvt.rn.satfinite.%6x2.f32 %1, %4, %5;\n"
-                    : "=r"(P_rmem[mma_id_q][mma_id_kv / 2][(mma_id_kv % 2) * 2]),
-                      "=r"(P_rmem[mma_id_q][mma_id_kv / 2][(mma_id_kv % 2) * 2 + 1])
+                    : "=r"(P_rmem[q][kv / 2][(kv % 2) * 2]),
+                      "=r"(P_rmem[q][kv / 2][(kv % 2) * 2 + 1])
                     : "f"(c1), "f"(c0), "f"(c3), "f"(c2),
                       "C"(Type_str<Type>::value));
       }
@@ -255,42 +240,40 @@ void attn_kernel(
       this_rowsumexp[1] += __shfl_xor_sync(0xFFFF'FFFF, this_rowsumexp[1], 2);
 
       // accumulate to total rowsumexp
-      rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
-      rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+      rowsumexp[q][0] = rowsumexp[q][0] * rescale[0] + this_rowsumexp[0];
+      rowsumexp[q][1] = rowsumexp[q][1] * rescale[1] + this_rowsumexp[1];
     }
 
     // V smem->rmem
-    asm volatile("cp.async.wait_group 1;\n");
+    asm volatile("cp.async.wait_group 1;");
     __syncthreads();
-    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
-      for (int mma_id_d = 0; mma_id_d < V_DIM / MMA_N; mma_id_d += 2) {
+    for (int kv = 0; kv < BLOCK_KV / MMA_K; kv++)
+      for (int d = 0; d < V_DIM / MMA_N; d += 2) {
         int addr = V_smem_thread;
-        addr += mma_id_kv * MMA_K * V_DIM * sizeof(Type);  // row
-        addr ^= mma_id_d * MMA_N * sizeof(Type);  // col
-        ldmatrix_trans<4>(V_rmem[mma_id_kv][mma_id_d], addr);
+        addr += kv * MMA_K * V_DIM * sizeof(Type);  // row
+        addr ^= d * MMA_N * sizeof(Type);  // col
+        ldmatrix<4, TRANS>(V_rmem[kv][d], addr);
       }
 
     // MMA O += P @ V [BLOCK_Q, DIM]
-    for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-      for (int mma_id_d = 0; mma_id_d < V_DIM / MMA_N; mma_id_d++)
-        for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_K; mma_id_kv++)
-          mma<Type, Type, float>(P_rmem[mma_id_q][mma_id_kv],
-                                 V_rmem[mma_id_kv][mma_id_d],
-                                 O_rmem[mma_id_q][mma_id_d]);
+    for (int q = 0; q < WARP_Q / MMA_M; q++)
+      for (int d = 0; d < V_DIM / MMA_N; d++)
+        for (int kv = 0; kv < BLOCK_KV / MMA_K; kv++)
+          mma<Type, Type, float>(P_rmem[q][kv], V_rmem[kv][d], O_rmem[q][d]);
   }
 
   // write to O
-  for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
-    for (int mma_id_d = 0; mma_id_d < V_DIM / MMA_N; mma_id_d++) {
-      const int row = warp_id * WARP_Q + (mma_id_q * MMA_M) + (lane_id / 4);
-      const int col = (mma_id_d * MMA_N) + (lane_id % 4) * 2;
+  for (int q = 0; q < WARP_Q / MMA_M; q++)
+    for (int d = 0; d < V_DIM / MMA_N; d++) {
+      const int row = warp_id * WARP_Q + (q * MMA_M) + (lane_id / 4);
+      const int col = (d * MMA_N) + (lane_id % 4) * 2;
 
       // divide by softmax denominator
-      float *regs = O_rmem[mma_id_q][mma_id_d];
-      regs[0] /= rowsumexp[mma_id_q][0];
-      regs[1] /= rowsumexp[mma_id_q][0];
-      regs[2] /= rowsumexp[mma_id_q][1];
-      regs[3] /= rowsumexp[mma_id_q][1];
+      float *regs = O_rmem[q][d];
+      regs[0] /= rowsumexp[q][0];
+      regs[1] /= rowsumexp[q][0];
+      regs[2] /= rowsumexp[q][1];
+      regs[3] /= rowsumexp[q][1];
 
       if constexpr (cuda::std::is_same_v<Type, nv_bfloat16>) {
         reinterpret_cast<nv_bfloat162 *>(O_gmem + (row + 0) * O_s1 + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});

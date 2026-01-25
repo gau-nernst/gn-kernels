@@ -6,23 +6,28 @@
 #include <cuda/std/type_traits>  // for std::is_same_v
 
 inline constexpr int WARP_SIZE = 32;
-inline constexpr int MMA_M = 16;
-inline constexpr int MMA_N = 8;
+
+// m16n8, k=32-byte
+struct SM80 {
+  static constexpr int MMA_M = 16;
+  static constexpr int MMA_N = 8;
+};
 
 __device__ __host__ constexpr
 int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-// NOTE: stride in bytes
+// stride is in bytes
+// row and col are in the unit of 16-byte
+//   (actually doesn't matter for row)
+// returns address
 template <int STRIDE>
 __device__
-int swizzle(int index) {
-  // no need swizzling
-  if constexpr (STRIDE == 16)
-    return index;
-
-  int row_idx = (index / STRIDE) % 8;
-  int bits_to_xor = row_idx / max(64 / STRIDE, 1);
-  return index ^ (bits_to_xor << 4);
+int swizzle(int row, int col) {
+  // when STRIDE=128-byte: col ^ (row % 8)      -> read 8 rows of 16-byte at a time, and swizzle them based on row
+  //      STRIDE=64-byte:  col ^ (row % 8) / 2) -> read 8 rows of 16-byte at a time, and swizzle them based on (row / 2)
+  if constexpr (STRIDE > 16)
+    col ^= (row % 8) / max(128 / STRIDE, 1);
+  return row * STRIDE + col * 16;
 }
 
 template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
@@ -44,7 +49,7 @@ void global_to_shared(int dst, const T *src, int src_stride, int tid) {
 
 template <int HEIGHT, int WIDTH, int TB_SIZE, typename T>
 __device__ inline
-void global_to_shared_swizzle(int dst, const T *src, int src_stride, int tid) {
+void cp_async_g2s_swizzle(int dst, const T *src, int src_stride, int tid) {
   static_assert(WIDTH * sizeof(T) >= 16);
   constexpr int num_elems = 16 / sizeof(T);
 
@@ -52,7 +57,8 @@ void global_to_shared_swizzle(int dst, const T *src, int src_stride, int tid) {
     const int row = idx / WIDTH;
     const int col = idx % WIDTH;
 
-    const int dst_addr = swizzle<WIDTH * sizeof(T)>(dst + (row * WIDTH + col) * sizeof(T));
+    // divide col by num_elems because swizzle<>() expects col to be in the unit of 16-byte
+    const int dst_addr = dst + swizzle<WIDTH * sizeof(T)>(row, col / num_elems);
     const T *src_addr = src + (row * src_stride + col);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
   };
@@ -69,40 +75,25 @@ void global_to_shared_swizzle(int dst, const T *src, int src_stride, int tid) {
   }
 }
 
-template <int num>
+static constexpr char NONE[] = "";
+static constexpr char TRANS[] = ".trans";
+
+template <int num, const char *trans = NONE>
 __device__ inline
 void ldmatrix(int *regs, int addr) {
   static_assert(num == 1 || num == 2 || num == 4);
   if constexpr (num == 1)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1%2.shared.b16 {%0}, [%1];"
                 : "=r"(regs[0])
-                : "r"(addr));
+                : "r"(addr), "C"(trans));
   else if constexpr (num == 2)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2%3.shared.b16 {%0, %1}, [%2];"
                 : "=r"(regs[0]), "=r"(regs[1])
-                : "r"(addr));
+                : "r"(addr), "C"(trans));
   else if constexpr (num == 4)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4%5.shared.b16 {%0, %1, %2, %3}, [%4];"
                 : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
-                : "r"(addr));
-}
-
-template <int num>
-__device__ inline
-void ldmatrix_trans(int *regs, int addr) {
-  static_assert(num == 1 || num == 2 || num == 4);
-  if constexpr (num == 1)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];"
-                : "=r"(regs[0])
-                : "r"(addr));
-  else if constexpr (num == 2)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
-                : "=r"(regs[0]), "=r"(regs[1])
-                : "r"(addr));
-  else if constexpr (num == 4)
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
-                : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
-                : "r"(addr));
+                : "r"(addr), "C"(trans));
 }
 
 struct int4x2 { char data; };
@@ -136,54 +127,50 @@ void mma(int A[4], int B[2], void *C) {
 
   // BF16/FP16/FP8 MMA with FP32 accumulate
   if constexpr (cuda::std::is_same_v<ctype, float>)
-    asm volatile("mma.sync.aligned.m16n8k%14.row.col.f32.%15.%16.f32 "
+    asm volatile("mma.sync.aligned.m16n8k%10.row.col.f32.%11.%12.f32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
-                "{%10, %11, %12, %13};"
-                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                "{%0, %1, %2, %3};"
+                : "+r"(D[0]), "+r"(D[1]), "+r"(D[2]), "+r"(D[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
                   "n"(MMA_K), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
   // FP16/FP8 MMA with FP16 accumulate
   else if constexpr (cuda::std::is_same_v<ctype, half>)
-    asm volatile("mma.sync.aligned.m16n8k%10.row.col.f16.%11.%12.f16 "
+    asm volatile("mma.sync.aligned.m16n8k%8.row.col.f16.%9.%10.f16 "
                 "{%0, %1}, "
                 "{%2, %3, %4, %5}, "
                 "{%6, %7}, "
-                "{%8, %9};"
-                : "=r"(D[0]), "=r"(D[1])
+                "{%0, %1};"
+                : "+r"(D[0]), "+r"(D[1])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]),
                   "n"(MMA_K), "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
   // INT4 MMA. override MMA shape.
   else if constexpr (cuda::std::is_same_v<atype, int4x2> || cuda::std::is_same_v<atype, uint4x2>)
-    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%15.s32 "
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%10.%11.s32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
-                "{%10, %11, %12, %13};"
-                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                "{%0, %1, %2, %3};"
+                : "+r"(D[0]), "+r"(D[1]), "+r"(D[2]), "+r"(D[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
                   "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 
   // INT8 MMA
   else if constexpr (cuda::std::is_same_v<ctype, int>)
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%14.%15.s32 "
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.%10.%11.s32 "
                 "{%0, %1, %2, %3}, "
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
-                "{%10, %11, %12, %13};"
-                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                "{%0, %1, %2, %3};"
+                : "+r"(D[0]), "+r"(D[1]), "+r"(D[2]), "+r"(D[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
                   "C"(Type_str<atype>::value), "C"(Type_str<btype>::value));
 }
 

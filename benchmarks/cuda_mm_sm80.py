@@ -3,14 +3,14 @@ import time
 import torch
 from triton.testing import do_bench
 
-from gn_kernels.cuda_mm import MatmulKernel
+from gn_kernels.cuda_mm import MatmulSm80Kernel
 
 
 def main(M: int, N: int, K: int):
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda").T
 
-    kernel = MatmulKernel(block_mnk=(128, 64, 64), num_stages=2)
+    kernel = MatmulSm80Kernel(block_mnk=(128, 64, 64), num_stages=2)
     torch.testing.assert_close(kernel.run(A, B), torch.mm(A, B))
 
     def bench(f, name: str):

@@ -9,9 +9,6 @@ uv pip install torch>=2.10 --index-url https://download.pytorch.org/whl/cu130
 uv pip install git+https://github.com/gau-nernst/gn_kernels --no-build-isolation
 ```
 
-TODO:
-- Cutlass with NVRTC?
-
 Available kernels
 
 - Cutlass
