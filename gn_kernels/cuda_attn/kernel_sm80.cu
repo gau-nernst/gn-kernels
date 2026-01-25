@@ -169,15 +169,15 @@ void attn_sm80_kernel(
 
       // rowmax
       float this_rowmax[2];
-      for (int kv = 0; kv < BLOCK_KV / MMA_N; kv++) {
+
+      // unroll 1st iteration
+      this_rowmax[0] = max(S_rmem[q][0][0], S_rmem[q][0][1]);
+      this_rowmax[1] = max(S_rmem[q][0][2], S_rmem[q][0][3]);
+
+      for (int kv = 1; kv < BLOCK_KV / MMA_N; kv++) {
         float *regs = S_rmem[q][kv];
-        if (kv == 0) {
-          this_rowmax[0] = max(regs[0], regs[1]);
-          this_rowmax[1] = max(regs[2], regs[3]);
-        } else {
-          this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
-          this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
-        }
+        this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));
+        this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));
       }
 
       // butterfly reduction within 4 threads
