@@ -3,3 +3,4 @@ ipykernel
 pytest
 ruff
 tabulate
+modal

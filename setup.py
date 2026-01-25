@@ -13,9 +13,10 @@ def get_extension(arch: str):
     else:
         gencode = f"arch=compute_{arch},code=compute_{arch}"  # compile to PTX
 
+    # pytorch injects Py_LIMITED_API by default now it seems
     return CUDAExtension(
         name=f"{NAME}.sm{arch}",
-        sources=[str(x) for x in CURRENT_DIR.glob(f"gn_kernels/csrc/sm{arch}/*.cu")],
+        sources=[str(x.relative_to(CURRENT_DIR)) for x in CURRENT_DIR.glob(f"gn_kernels/csrc/sm{arch}/*.cu")],
         py_limited_api=True,
         extra_compile_args=dict(
             nvcc=[
@@ -26,7 +27,6 @@ def get_extension(arch: str):
                 # "-Xptxas=-v",
             ]
         ),
-        define_macros=[("Py_LIMITED_API", "0x03090000")],
     )
 
 

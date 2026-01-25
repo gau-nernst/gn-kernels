@@ -1,3 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gn-kernels"
+version = "0.0.0"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+gn_kernels = ["**/*.cu", "**/*.h"]
+
 [tool.ruff]
 line-length = 120
 extend-exclude = ["cutlass", "*.ipynb"]
