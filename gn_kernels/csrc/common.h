@@ -6,8 +6,12 @@
 #include <cuda/std/type_traits>  // for std::is_same_v
 
 inline constexpr int WARP_SIZE = 32;
-inline constexpr int MMA_M = 16;
-inline constexpr int MMA_N = 8;
+
+// m16n8, k=32-byte
+struct SM80 {
+  static constexpr int MMA_M = 16;
+  static constexpr int MMA_N = 8;
+};
 
 __device__ __host__ constexpr
 int cdiv(int a, int b) { return (a + b - 1) / b; }

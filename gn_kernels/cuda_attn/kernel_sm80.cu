@@ -47,6 +47,8 @@ void attn_sm80_kernel(
   constexpr int WARP_Q = BLOCK_Q / NUM_WARPS;
 
   // m16n8k16
+  constexpr int MMA_M = SM80::MMA_M;
+  constexpr int MMA_N = SM80::MMA_N;
   constexpr int MMA_K = 16;
 
   const int q_offset = q_block_id * BLOCK_Q;

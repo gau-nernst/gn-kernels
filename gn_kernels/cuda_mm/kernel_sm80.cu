@@ -23,6 +23,9 @@ void matmul_sm80_kernel(
   constexpr int WARP_M = BLOCK_M / NUM_WARP_M;
   constexpr int WARP_N = BLOCK_N / NUM_WARP_N;
   constexpr int TB_SIZE = NUM_WARP_M * NUM_WARP_N * WARP_SIZE;
+
+  constexpr int MMA_M = SM80::MMA_M;
+  constexpr int MMA_N = SM80::MMA_N;
   constexpr int MMA_K = 32 / sizeof(TypeAB);
 
   const int tid = threadIdx.x;
