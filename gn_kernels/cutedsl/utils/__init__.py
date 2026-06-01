@@ -1,8 +1,23 @@
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 
 from cutlass import BFloat16, Float32, Uint32, cute
+
+
+def simple_tma_g2s(atom, src, dst, mbar):
+    """A simple helper that wraps group_modes() and tma_partition()
+    NOTE: this should be called WITHOUT cute.elect_one()
+    """
+    s_part, g_part = cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(dst, 0),
+        cute.group_modes(src, 0),
+    )
+    cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar)
 
 
 @dsl_user_op

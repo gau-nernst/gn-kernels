@@ -9,7 +9,8 @@ from torch import Tensor
 
 import cutlass
 from cutlass import BFloat16, Float32, Int32, cute
-from gn_kernels.cutedsl.utils import mma_bf16
+
+from .utils import mma_bf16
 
 
 class MatmulSm80(NamedTuple):
