@@ -2,31 +2,37 @@ import math
 from functools import cache
 from typing import NamedTuple
 
+import torch
 from cuda.bindings.driver import CUstream
 from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from torch import Tensor
 
 import cutlass
-from cutlass import BFloat16, Float32, Int32, cute
+from cutlass import Float32, Int8, Int32, cute
 
-from .utils import mma_bf16
+from .utils import TORCH_TO_CUTE_DTYPE, mma_sync
 
 
 class MatmulSm80(NamedTuple):
+    dtype: cutlass.Numeric
+    acc_dtype: cutlass.Numeric
     warp_layout: tuple[int, int] = (2, 2)
     cta_tile: tuple[int, int, int] = (128, 128, 32)
     num_stages: int = 2
 
     @cute.jit
     def make_AB_layout(self, BM: int, BK: int, num_stages: int):
-        # only go up to 128B
-        swizzle_width = min(BK, 64)
+        # only go up to 128B i.e. 64 for BF16
+        elem_width = self.dtype.width // 8  # in byte
+        swizzle_width = min(BK, 128 // elem_width)
 
         # canonical 128B swizzling is (3,4,3) on raw smem address.
         # for BF16, each elem = 2 bytes -> 128B swizzling is (3, 3, 3).
-        swizzle_bits = int(math.log2(swizzle_width * 2 // 16))
-        swizzle = cute.make_swizzle(swizzle_bits, 3, 3)
+        B = int(math.log2(swizzle_width * 2 // 16))
+        M = int(math.log2(16 // elem_width))
+        S = 3
+        swizzle = cute.make_swizzle(B, M, S)
 
         slayout = cute.make_layout(
             (BM, (swizzle_width, BK // swizzle_width), num_stages),
@@ -68,6 +74,8 @@ class MatmulSm80(NamedTuple):
         lane_id = tid % 32
 
         _, K = gA.shape
+        dtype = self.dtype
+        acc_dtype = self.acc_dtype
         BM, BN, BK = self.cta_tile
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
@@ -83,8 +91,8 @@ class MatmulSm80(NamedTuple):
 
         # allocate shared memory
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(BFloat16, sA_layout, 16)
-        sB = smem.allocate_tensor(BFloat16, sB_layout, 16)
+        sA = smem.allocate_tensor(dtype, sA_layout, 16)
+        sB = smem.allocate_tensor(dtype, sB_layout, 16)
 
         # warp partition
         # shape: (WM, BK, num_stages)
@@ -110,13 +118,13 @@ class MatmulSm80(NamedTuple):
 
         # ldmatrix.x4
         ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
-        ldsm_atom = cute.make_copy_atom(ldsm_op, BFloat16)
+        ldsm_atom = cute.make_copy_atom(ldsm_op, dtype)
 
         # registers
         # let ptxas decides register reuse for rA and rB
-        rA = cute.make_rmem_tensor((8, WM // 16, BK // 16), BFloat16)
-        rB = cute.make_rmem_tensor(((4, 2), WN // 16, BK // 16), BFloat16)
-        rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
+        rA = cute.make_rmem_tensor((8, WM // 16, BK // 16), dtype)
+        rB = cute.make_rmem_tensor(((4, 2), WN // 16, BK // 16), dtype)
+        rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), acc_dtype)
         rC.fill(0.0)
 
         # prefetch
@@ -148,14 +156,14 @@ class MatmulSm80(NamedTuple):
 
                 for m in cutlass.range_constexpr(WM // 16):
                     for n in cutlass.range_constexpr(WN // 16):
-                        rC[None, n * 2 + 0, m] = mma_bf16(rA[None, m, k], rB[(None, 0), n, k], rC[None, n * 2 + 0, m])
-                        rC[None, n * 2 + 1, m] = mma_bf16(rA[None, m, k], rB[(None, 1), n, k], rC[None, n * 2 + 1, m])
+                        rC[None, n * 2 + 0, m] = mma_sync(rA[None, m, k], rB[(None, 0), n, k], rC[None, n * 2 + 0, m])
+                        rC[None, n * 2 + 1, m] = mma_sync(rA[None, m, k], rB[(None, 1), n, k], rC[None, n * 2 + 1, m])
 
             compute_stage = (compute_stage + 1) % num_stages
 
         # epilogue
         cp_op = nvgpu.CopyUniversalOp()
-        cp4B_atom = cute.make_copy_atom(cp_op, BFloat16, num_bits_per_copy=32)
+        cp_atom = cute.make_copy_atom(cp_op, dtype, num_bits_per_copy=2 * gC.element_type.width)
 
         # create view into C gmem
         gC_cta = cute.local_tile(gC, tiler=(BM, BN), coord=(bid_m, bid_n))
@@ -173,48 +181,61 @@ class MatmulSm80(NamedTuple):
         # explicit for loop to interleave cvt with st.global
         for m in cutlass.range_constexpr(WM // 16):
             for n in cutlass.range_constexpr(WN // 8):
-                rC_bf16 = cute.make_rmem_tensor((2, 2), BFloat16)
-                rC_bf16.store(rC[None, n, m].load().to(BFloat16))
-                cute.copy(cp4B_atom, rC_bf16, gC_thr[None, None, m, n])
+                if cutlass.const_expr(acc_dtype == gC.element_type):
+                    cute.copy(cp_atom, rC[None, n, m], gC_thr[None, None, m, n])
+                else:
+                    rC_bf16 = cute.make_rmem_tensor((2, 2), dtype)
+                    rC_bf16.store(rC[None, n, m].load().to(dtype))
+                    cute.copy(cp_atom, rC_bf16, gC_thr[None, None, m, n])
 
     @cute.jit
     def load_g2s(self, gA: cute.Tensor, sA: cute.Tensor, tid: Int32):
+        # recast as bytes
+        gA = cute.recast_tensor(gA, Int8)
+        sA = cute.recast_tensor(sA, Int8)
+
         # cp.async.cg
         op = cpasync.CopyG2SOp(nvgpu.LoadCacheMode.GLOBAL)
-        atom = cute.make_copy_atom(op, BFloat16, num_bits_per_copy=128)
+        atom = cute.make_copy_atom(op, Int8, num_bits_per_copy=128)
 
         tb_size = math.prod(self.warp_layout) * 32
         _, _, BK = self.cta_tile
+        BK_ = BK * (self.dtype.width // 8)
 
-        num_cols = BK // 8
+        num_cols = BK_ // 16
         num_rows = tb_size // num_cols
 
-        # (num_rows, 8, BM/num_rows)
-        gA_view = cute.local_tile(gA, (num_rows, 8), (None, tid % num_cols))
-        sA_view = cute.local_tile(sA, (num_rows, 8), (None, tid % num_cols))
+        # (num_rows, 16B, BM/num_rows)
+        gA_view = cute.local_tile(gA, (num_rows, 16), (None, tid % num_cols))
+        sA_view = cute.local_tile(sA, (num_rows, 16), (None, tid % num_cols))
 
-        # (8, BM/num_rows)
+        # (16B, BM/num_rows)
         gA_view = gA_view[tid // num_cols, None, None]
         sA_view = sA_view[tid // num_cols, None, None]
         cute.copy(atom, gA_view, sA_view)
 
     @cache
     @staticmethod
-    def compile():
-        M = cute.sym_int()
-        N = cute.sym_int(divisibility=8)
-        K = cute.sym_int(divisibility=8)
+    def compile(dtype: torch.dtype):
+        cute_dtype: cutlass.Numeric = TORCH_TO_CUTE_DTYPE[dtype]
+        acc_dtype = Float32 if dtype.is_floating_point else Int32
 
-        A = cute.runtime.make_fake_tensor(BFloat16, (M, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        B = cute.runtime.make_fake_tensor(BFloat16, (N, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
+        divisibility = 128 // cute_dtype.width  # 16B
+        acc_divisibility = 128 // acc_dtype.width
+        M = cute.sym_int()
+        N = cute.sym_int()
+        K = cute.sym_int()
+
+        A = cute.runtime.make_fake_tensor(cute_dtype, (M, K), (cute.sym_int64(divisibility), 1), assumed_align=16)
+        B = cute.runtime.make_fake_tensor(cute_dtype, (N, K), (cute.sym_int64(divisibility), 1), assumed_align=16)
+        C = cute.runtime.make_fake_tensor(cute_dtype, (M, N), (cute.sym_int64(acc_divisibility), 1), assumed_align=16)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-        kernel = MatmulSm80()
+        kernel = MatmulSm80(cute_dtype, acc_dtype)
         return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")
 
 
 def mm(A: Tensor, B: Tensor):
     C = A.new_empty(A.shape[0], B.shape[1])
-    MatmulSm80.compile()(A, B.T, C)
+    MatmulSm80.compile(A.dtype)(A, B.T, C)
     return C
