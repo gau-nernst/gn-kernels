@@ -198,20 +198,18 @@ class MatmulMXFP8Sm100:
                 multicast_mask = Uint16((1 << cta_group) - 1)
 
                 for bid in range(raw_bid, grid_m * grid_n, num_bids):
-                    # when BN=128
-                    #   d_tmem (stage0): [  0, 128]
-                    #   d_tmem (stage1): [128, 256]
-                    #   sf_tmem        : [384, 512]
-                    # when BN=256
+                    # we only have 512 tmem columns. when BN=256, d_tmem across
+                    # 2 stages need to overlap 16 columns, leaving the remaning
+                    # 16 columns for SFA+SFB.
                     #   d_tmem (stage0): [  0, 256]
-                    #   d_tmem (stage1): [128, 384]
-                    #   sf_tmem        : [384, 512]
+                    #   d_tmem (stage1): [240, 496]
+                    #   sf_tmem        : [496, 512]
                     #
                     # for a [128,128] A or B tile, its corresponding SF tile is [128,4]
                     # NVIDIA layout permutes it as [32,4][32,4][32,4][32,4]
                     # hence, a single tcgen05.cp.32x128b is enough to cover 1 [128,128] tile.
-                    d_tmem = tmem_stage * 128
-                    sfa_tmem = 384
+                    d_tmem = tmem_stage * 240
+                    sfa_tmem = 496
                     sfb_tmem = sfa_tmem + 4
 
                     cute.arch.mbarrier_wait(tmem_empty_mbar + tmem_stage, tmem_empty_parity)
@@ -309,30 +307,37 @@ class MatmulMXFP8Sm100:
                         cute.copy(bf16x16_atom, tmp, C_[None, coord])
 
                 elif cutlass.const_expr(BN == 256):
-                    C_tile = cute.local_tile(C_tensor, (BM, BN), (bid_m, bid_n))
-                    C_subtiles = cute.logical_divide(C_tile[tid, None], cute.make_layout((16, 8)))  # ((16, 8), 2)
-
-                    # always load [128,256] tmem columns first
-                    regs = _tcgen05.ld(warp_id * 32, 128, "32x32b", 128)
+                    # always load [240,256] tmem columns first
+                    regs = _tcgen05.ld(warp_id * 32, 240, "32x32b", 16)
                     _tcgen05.wait_ld()
                     _tcgen05.fence_before_thread_sync()
                     mbarrier.arrive(tmem_empty_mbar_ + (tmem_stage + 2), "cluster")
 
-                    tmp = cute.make_rmem_tensor((16, 8), BFloat16)
+                    tmp = cute.make_rmem_tensor(16, BFloat16)
                     tmp.store(regs.to(BFloat16))
-                    cute.copy(bf16x16_atom, tmp, C_subtiles[(None, None), 1 - tmem_stage])
+
+                    # C_ shape: (WIDTH, (M, N/WIDTH))
+                    coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + (BN // WIDTH - 1) * (1 - tmem_stage))
+                    cute.copy(bf16x16_atom, tmp, C_[None, coord])
 
                     # load the remaining
-                    #   tmem_stage=0: [  0,128]
-                    #   tmem_stage=1: [256,384]
-                    regs = _tcgen05.ld(warp_id * 32, tmem_stage * 256, "32x32b", 128)
-                    _tcgen05.wait_ld()
-                    _tcgen05.fence_before_thread_sync()
-                    mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
+                    #   tmem_stage=0: [  0,240]
+                    #   tmem_stage=1: [256,496]
+                    for i in cutlass.range_constexpr(BN // WIDTH - 1):
+                        tcol = tmem_stage * 256 + i * WIDTH
+                        regs = _tcgen05.ld(warp_id * 32, tcol, "32x32b", WIDTH)
+                        _tcgen05.wait_ld()
 
-                    tmp = cute.make_rmem_tensor((16, 8), BFloat16)
-                    tmp.store(regs.to(BFloat16))
-                    cute.copy(bf16x16_atom, tmp, C_subtiles[(None, None), tmem_stage])
+                        if cutlass.const_expr(i == BN // WIDTH - 2):
+                            _tcgen05.fence_before_thread_sync()
+                            mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
+
+                        tmp = cute.make_rmem_tensor(16, BFloat16)
+                        tmp.store(regs.to(BFloat16))
+
+                        # C_ shape: (WIDTH, (M, N/WIDTH))
+                        coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + tmem_stage + i)
+                        cute.copy(bf16x16_atom, tmp, C_[None, coord])
 
                 tmem_stage = (tmem_stage + 1) % 2
                 if tmem_stage == 0:
