@@ -162,19 +162,17 @@ class MatmulSm100:
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_parity)
                         _tcgen05.fence_after_thread_sync()
 
-                        with cute.arch.elect_one():
-                            for k in cutlass.range_constexpr(BK // 16):
-                                _tcgen05.mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
-                                a_desc += 32 >> 4
-                                b_desc += 32 >> 4
-                            _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
+                        for k in cutlass.range_constexpr(BK // 16):
+                            _tcgen05.mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
+                            a_desc += 32 >> 4
+                            b_desc += 32 >> 4
+                        _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % num_stages
                         if tma_stage == 0:
                             tma_full_parity ^= 1
 
-                    with cute.arch.elect_one():
-                        _tcgen05.commit(tmem_full_mbar + tmem_stage, multicast_mask, cta_group)
+                    _tcgen05.commit(tmem_full_mbar + tmem_stage, multicast_mask, cta_group)
 
                     tmem_stage = (tmem_stage + 1) % 2
                     if tmem_stage == 0:

@@ -231,28 +231,26 @@ class MatmulMXFP8Sm100:
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_parity)
                         _tcgen05.fence_after_thread_sync()
 
-                        with cute.arch.elect_one():
-                            _tcgen05.cp(sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group)
-                            for j in cutlass.range_constexpr(BN // 128):
-                                _tcgen05.cp(sfb_tmem + j * 4, sfb_desc, "32x128b", "warpx4", cta_group)
-                                sfb_desc += (128 * 4) >> 4
+                        _tcgen05.cp(sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group)
+                        for j in cutlass.range_constexpr(BN // 128):
+                            _tcgen05.cp(sfb_tmem + j * 4, sfb_desc, "32x128b", "warpx4", cta_group)
+                            sfb_desc += (128 * 4) >> 4
 
-                            for k in cutlass.range_constexpr(BK // 32):
-                                enable_input_d = iter_k > 0 or k > 0
-                                _tcgen05.mma_mxfp8(
-                                    d_tmem, a_desc, b_desc, idesc, sfa_tmem, sfb_tmem, enable_input_d, cta_group
-                                )
-                                a_desc += 32 >> 4
-                                b_desc += 32 >> 4
-                                idesc += (1 << 4) | (1 << 29)  # increment SF ID
-                            _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
+                        for k in cutlass.range_constexpr(BK // 32):
+                            enable_input_d = iter_k > 0 or k > 0
+                            _tcgen05.mma_mxfp8(
+                                d_tmem, a_desc, b_desc, idesc, sfa_tmem, sfb_tmem, enable_input_d, cta_group
+                            )
+                            a_desc += 32 >> 4
+                            b_desc += 32 >> 4
+                            idesc += (1 << 4) | (1 << 29)  # increment SF ID
+                        _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % num_stages
                         if tma_stage == 0:
                             tma_full_parity ^= 1
 
-                    with cute.arch.elect_one():
-                        _tcgen05.commit(tmem_full_mbar + tmem_stage, multicast_mask, cta_group)
+                    _tcgen05.commit(tmem_full_mbar + tmem_stage, multicast_mask, cta_group)
 
                     # wait for partial tmem load to finish
                     if cutlass.const_expr(BN == 256):
