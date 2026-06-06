@@ -15,8 +15,8 @@ def get_extension(arch: str):
         gencode = f"arch=compute_{arch},code=compute_{arch}"  # compile to PTX
 
     nvcc_flags = [
-        f"-I{CURRENT_DIR / 'cutlass/include'}",
-        f"-I{CURRENT_DIR / 'cutlass/tools/util/include'}",
+        f"-I{CURRENT_DIR / 'third_party/cutlass/include'}",
+        f"-I{CURRENT_DIR / 'third_party/cutlass/tools/util/include'}",
         f"-gencode={gencode}",
         # "-DCUTLASS_DEBUG_TRACE_LEVEL=1",
         # "-Xptxas=-v",

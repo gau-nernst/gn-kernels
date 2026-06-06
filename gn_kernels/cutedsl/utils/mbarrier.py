@@ -1,7 +1,6 @@
+from cutlass import Int32
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import dsl_user_op
-
-from cutlass import Int32
 
 SPACE_MAP = dict(
     cta=nvvm.MBarrierSpaceKind.CTA,
@@ -20,8 +19,8 @@ MEMORY_ORDER_MAP = dict(
 @dsl_user_op
 def arrive(mbar, space: str = "cta", order: str = "relaxed", *, loc=None, ip=None):
     nvvm.mbarrier_txn(
-        mbar.to_llvm_ptr(),
-        Int32(1).ir_value(),
+        mbar.to_llvm_ptr(loc=loc, ip=ip),
+        Int32(1).ir_value(loc=loc, ip=ip),
         kind=nvvm.MBarrierTxnKind.ARRIVE,
         space=SPACE_MAP[space],
         order=MEMORY_ORDER_MAP[order],
@@ -33,8 +32,8 @@ def arrive(mbar, space: str = "cta", order: str = "relaxed", *, loc=None, ip=Non
 @dsl_user_op
 def arrive_expect_tx(mbar, size, space: str = "cta", order: str = "relaxed", *, loc=None, ip=None):
     nvvm.mbarrier_txn(
-        mbar.to_llvm_ptr(),
-        Int32(size).ir_value(),
+        mbar.to_llvm_ptr(loc=loc, ip=ip),
+        Int32(size).ir_value(loc=loc, ip=ip),
         kind=nvvm.MBarrierTxnKind.ARRIVE_EXPECT_TX,
         space=SPACE_MAP[space],
         order=MEMORY_ORDER_MAP[order],

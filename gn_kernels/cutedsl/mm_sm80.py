@@ -2,14 +2,13 @@ import math
 from functools import cache
 from typing import NamedTuple
 
+import cutlass
 import torch
 from cuda.bindings.driver import CUstream
+from cutlass import Float32, Int8, Int32, cute
 from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from torch import Tensor
-
-import cutlass
-from cutlass import Float32, Int8, Int32, cute
 
 from .utils import TORCH_TO_CUTE_DTYPE, mma_sync
 

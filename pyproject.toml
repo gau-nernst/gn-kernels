@@ -14,7 +14,7 @@ gn_kernels = ["**/*.cu", "**/*.h"]
 
 [tool.ruff]
 line-length = 120
-extend-exclude = ["cutlass", "*.ipynb"]
+extend-exclude = ["third_party/cutlass", "*.ipynb"]
 
 [tool.ruff.lint]
 extend-select = ["I"]

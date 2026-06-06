@@ -1,10 +1,9 @@
 import torch
+from cutlass import BFloat16, Float16, Float32, Int8, Int32, Uint8, Uint32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
-
-from cutlass import BFloat16, Float16, Float32, Int8, Int32, Uint8, Uint32, cute
 
 TORCH_TO_CUTE_DTYPE = {
     torch.float32: Float32,
@@ -39,6 +38,18 @@ def simple_tma_g2s(atom, src, dst, mbar):
         cute.group_modes(src, 0),
     )
     cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar)
+
+
+@dsl_user_op
+def to_cta0_smem(ptr: cute.Pointer, *, loc=None, ip=None):
+    return cute.make_ptr(
+        ptr.dtype,
+        ptr.toint(loc=loc, ip=ip) & 0xFEFF_FFFF,
+        cute.AddressSpace.smem,
+        assumed_align=8,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op

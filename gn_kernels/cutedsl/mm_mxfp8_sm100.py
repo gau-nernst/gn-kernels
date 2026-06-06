@@ -3,22 +3,22 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Int32, Int64, Uint16, cute
+from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int32, Int64, Uint16, Uint64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.runtime import make_fake_tensor
 from cutlass.utils import get_smem_capacity_in_bytes
 
 from .utils import _tcgen05, mbarrier, simple_tma_g2s, to_cta0_smem
 
 
-class MatmulSm100:
-    def __init__(self, BN: int = 128, cta_group: int = 1) -> None:
-        BM = 128
-        BK = 64
-        self.cta_tile = (BM, BN, BK)
+class MatmulMXFP8Sm100:
+    def __init__(self, cta_group: int = 1) -> None:
+        self.cta_tile = (128, 128, 128)
         self.cta_group = cta_group
+        BM, BN, BK = self.cta_tile
 
         smem_bytes = get_smem_capacity_in_bytes()
-        self.stage_size = (BM + (BN // cta_group)) * BK * 2
+        self.stage_size = (BM + (BN // cta_group)) * BK + (BM + BN) * (BK // 32)
         self.num_stages = smem_bytes // self.stage_size
 
     @cute.jit
@@ -34,11 +34,29 @@ class MatmulSm100:
         return tma_atom, tma_tensor, s_layout
 
     @cute.jit
-    def __call__(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream: CUstream):
+    def prepare_SF(self, SF: cute.Tensor, size: cutlass.Constexpr):
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(
+            cta_group=tcgen05.CtaGroup.TWO if self.cta_group == 2 else tcgen05.CtaGroup.ONE
+        )
+        # due to TMA restriction of boxDim <= 256, we have to cast SF dtype to Int64
+        # CuteDSL doesn't warn or tell us how it handles boxDim > 256
+        # with Int64, we can support up to size=2048
+        SF_i64 = cute.recast_tensor(SF, Int64)
+        size_i64 = size // 8
+        s_layout = cute.make_layout((size_i64, self.num_stages))
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, SF_i64, s_layout, size_i64)
+        return tma_atom, tma_tensor, s_layout
+
+    @cute.jit
+    def __call__(
+        self, A: cute.Tensor, B: cute.Tensor, SFA: cute.Tensor, SFB: cute.Tensor, C: cute.Tensor, stream: CUstream
+    ):
         BM, BN, BK = self.cta_tile
         A_args = self.prepare_AB(A, BM, BK)
         B_args = self.prepare_AB(B, BN // self.cta_group, BK)
-        self.kernel(A_args, B_args, C).launch(
+        SFA_args = self.prepare_SF(SFA, BM * (BK // 32))
+        SFB_args = self.prepare_SF(SFB, BN * (BK // 32))
+        self.kernel(A_args, B_args, SFA_args, SFB_args, C).launch(
             grid=(128, 1, 1),
             block=(6 * 32, 1, 1),
             cluster=(self.cta_group, 1, 1),
@@ -50,6 +68,8 @@ class MatmulSm100:
         self,
         A_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
         B_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
+        SFA_args: tuple[cute.CopyAtom, cute.Tensor, cute.Layout],
+        SFB_args: tuple[cute.CopyAtom, cute.Tensor, cute.Layout],
         C_tensor: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
@@ -66,11 +86,16 @@ class MatmulSm100:
 
         A_tma_atom, A_tma_tensor, sA_layout = A_args
         B_tma_atom, B_tma_tensor, sB_layout = B_args
+        SFA_tma_atom, SFA_tma_tensor, sSFA_layout = SFA_args
+        SFB_tma_atom, SFB_tma_tensor, sSFB_layout = SFB_args
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(BFloat16, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
-        sB = smem.allocate_tensor(BFloat16, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
+        sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        sSFA = smem.allocate_tensor(Int64, sSFA_layout, byte_alignment=128)
+        sSFB = smem.allocate_tensor(Int64, sSFB_layout, byte_alignment=128)
+
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
         tmem_full_mbar = smem.allocate_array(Int64, 2)
@@ -100,8 +125,8 @@ class MatmulSm100:
         else:
             cute.arch.sync_threads()
 
+        # TMA warp
         if warp_id == 5:
-            # TMA warp
             tma_stage = 0
             parity = 1
 
@@ -113,6 +138,8 @@ class MatmulSm100:
             # select gmem tile
             gA_tiles = cute.zipped_divide(A_tma_tensor, (BM, BK))  # [(BM, BK), (M/BM, K/BK)]
             gB_tiles = cute.zipped_divide(B_tma_tensor, (BN // cta_group, BK))
+            SFA_tiles = cute.logical_divide(SFA_tma_tensor, BM * (BK // 32) // 8)
+            SFB_tiles = cute.logical_divide(SFB_tma_tensor, BN * (BK // 32) // 8)
 
             for bid in range(raw_bid, grid_m * grid_n, num_bids):
                 bid_m = bid // (grid_n * 2) * 2 + bid % 2
@@ -121,6 +148,8 @@ class MatmulSm100:
 
                 for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
                     mbar = tma_full_mbar_ + tma_stage
+                    sfa_idx = bid_m * (K // BK) + iter_k
+                    sfb_idx = bid_n * (K // BK) + iter_k
 
                     cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
 
@@ -128,13 +157,15 @@ class MatmulSm100:
                         mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
                     simple_tma_g2s(A_tma_atom, gA_tiles[None, (bid_m, iter_k)], sA[None, None, tma_stage], mbar)
                     simple_tma_g2s(B_tma_atom, gB_tiles[None, (bid_n_, iter_k)], sB[None, None, tma_stage], mbar)
+                    cute.copy(SFA_tma_atom, SFA_tiles[None, sfa_idx], sSFA[None, tma_stage], tma_bar_ptr=mbar)
+                    cute.copy(SFB_tma_atom, SFB_tiles[None, sfb_idx], sSFB[None, tma_stage], tma_bar_ptr=mbar)
 
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:
                         parity ^= 1
 
+        # MMA warp
         elif warp_id == 4:
-            # MMA warp
             _tcgen05.alloc(taddr, cta_group)
 
             if cta_rank == 0:
@@ -146,8 +177,8 @@ class MatmulSm100:
                 # BF16 MMA
                 MMA_M = BM * cta_group
                 MMA_N = BN
-                idesc = _tcgen05.make_idesc_bf16(MMA_M, MMA_N)
                 sdesc = _tcgen05.make_sdesc_128B()
+                sdesc_sf = Uint64(((8 * 16) >> 4 << 32) | (1 << 46))  # SBO=8*16
                 multicast_mask = Uint16((1 << cta_group) - 1)
 
                 for bid in range(raw_bid, grid_m * grid_n, num_bids):
@@ -155,18 +186,43 @@ class MatmulSm100:
                     _tcgen05.fence_after_thread_sync()
 
                     for iter_k in cutlass.range(cute.ceil_div(K, BK), unroll=1):
-                        d_tmem = BN * tmem_stage
+                        # when BN=128
+                        #   d_tmem (stage0): [  0, 128]
+                        #   d_tmem (stage1): [128, 256]
+                        #   sf_tmem        : [384, 512]
+                        # when BN=256
+                        #   d_tmem (stage0): [  0, 256]
+                        #   d_tmem (stage1): [128, 384]
+                        #   sf_tmem        : [384, 512]
+                        #
+                        # for a [128,128] A or B tile, its corresponding SF tile is [128,4]
+                        # NVIDIA layout permutes it as [32,4][32,4][32,4][32,4]
+                        # hence, a single tcgen05.cp.32x128b is enough to cover 1 [128,128] tile.
+                        d_tmem = tmem_stage * 128
+                        sfa_tmem = 384
+                        sfb_tmem = sfa_tmem + 4
                         a_desc = sdesc | (sA[None, None, tma_stage].iterator.toint() >> 4)
                         b_desc = sdesc | (sB[None, None, tma_stage].iterator.toint() >> 4)
+                        sfa_desc = sdesc_sf | (sSFA[None, tma_stage].iterator.toint() >> 4)
+                        sfb_desc = sdesc_sf | (sSFB[None, tma_stage].iterator.toint() >> 4)
+
+                        idesc = _tcgen05.make_idesc_mxfp8(MMA_M, MMA_N)
 
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_parity)
                         _tcgen05.fence_after_thread_sync()
 
                         with cute.arch.elect_one():
-                            for k in cutlass.range_constexpr(BK // 16):
-                                _tcgen05.mma_f16(d_tmem, a_desc, b_desc, idesc, iter_k > 0 or k > 0, cta_group)
+                            _tcgen05.cp(sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group)
+                            _tcgen05.cp(sfb_tmem, sfb_desc, "32x128b", "warpx4", cta_group)
+
+                            for k in cutlass.range_constexpr(BK // 32):
+                                enable_input_d = iter_k > 0 or k > 0
+                                _tcgen05.mma_mxfp8(
+                                    d_tmem, a_desc, b_desc, idesc, sfa_tmem, sfb_tmem, enable_input_d, cta_group
+                                )
                                 a_desc += 32 >> 4
                                 b_desc += 32 >> 4
+                                idesc += (1 << 4) | (1 << 29)  # increment SF ID
                             _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % num_stages
@@ -180,8 +236,8 @@ class MatmulSm100:
                     if tmem_stage == 0:
                         tmem_empty_parity ^= 1
 
+        # epilogue warps
         else:
-            # epilogue warps
             # (WIDTH, (M, N/WIDTH))
             WIDTH = cutlass.const_expr(16)
             C_ = cute.zipped_divide(C_tensor, (1, WIDTH))[(0, None), None]
@@ -211,7 +267,7 @@ class MatmulSm100:
                 _tcgen05.fence_after_thread_sync()
 
                 for i in cutlass.range_constexpr(BN // WIDTH):
-                    tcol = tmem_stage * BN + i * WIDTH
+                    tcol = tmem_stage * 128 + i * WIDTH
                     regs = _tcgen05.ld(warp_id * 32, tcol, "32x32b", WIDTH)
                     _tcgen05.wait_ld()
 
@@ -240,19 +296,23 @@ class MatmulSm100:
 
     @cache
     @staticmethod
-    def compile(BN: int = 128, cta_group: int = 2):
+    def compile(cta_group: int = 1):
         M = cute.sym_int()
         N = cute.sym_int()
         K = cute.sym_int()
-        A = cute.runtime.make_fake_tensor(BFloat16, (M, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        B = cute.runtime.make_fake_tensor(BFloat16, (N, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        C = cute.runtime.make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
+
+        A = make_fake_tensor(Float8E4M3FN, (M, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
+        B = make_fake_tensor(Float8E4M3FN, (N, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
+        SFA = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
+        SFB = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
+        C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
+
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = MatmulSm100(BN, cta_group)
-        return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")
+        kernel = MatmulMXFP8Sm100(cta_group)
+        return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, B: torch.Tensor):
-    C = A.new_empty(A.shape[0], B.shape[1])
-    MatmulSm100.compile(256, 2)(A, B.T, C)
+def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
+    C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
+    MatmulMXFP8Sm100.compile(1)(A, B, SFA.view(-1), SFB.view(-1), C)
     return C

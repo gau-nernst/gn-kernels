@@ -4,3 +4,7 @@ pytest
 ruff
 tabulate
 modal
+torch
+nvidia-cutlass-dsl[cu13]
+apache-tvm-ffi
+cupti-python
