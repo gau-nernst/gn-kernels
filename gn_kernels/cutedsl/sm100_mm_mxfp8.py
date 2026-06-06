@@ -118,7 +118,7 @@ class MatmulMXFP8Sm100:
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
         tmem_full_mbar = smem.allocate_array(Int64, 2)
-        tmem_empty_mbar = smem.allocate_array(Int64, 2 * (BN // 128))
+        tmem_empty_mbar = smem.allocate_array(Int64, 2)
         if cutlass.const_expr(BN == 256):
             partial_mbar = smem.allocate_array(Int64, 1)
         taddr = smem.allocate(Int32, 4)
