@@ -30,13 +30,9 @@ def simple_tma_g2s(atom, src, dst, mbar):
     """A simple helper that wraps group_modes() and tma_partition()
     NOTE: this should be called WITHOUT cute.elect_one()
     """
-    s_part, g_part = cpasync.tma_partition(
-        atom,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(dst, 0),
-        cute.group_modes(src, 0),
-    )
+    dst = cute.group_modes(dst, 0)
+    src = cute.group_modes(src, 0)
+    s_part, g_part = cpasync.tma_partition(atom, 0, cute.make_layout(1), dst, src)
     cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar)
 
 
@@ -54,7 +50,7 @@ def to_cta0_smem(ptr: cute.Pointer, *, loc=None, ip=None):
 
 @dsl_user_op
 def recast_val(x, dtype, *, loc=None, ip=None):
-    return dtype(llvm.bitcast(dtype.mlir_type, x.ir_value(loc=loc, ip=ip)))
+    return dtype(llvm.bitcast(dtype.mlir_type, x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
 @dsl_user_op
@@ -70,8 +66,8 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
     mlir_ty = c.element_type.mlir_type
     K = 256 // a.element_type.width  # 32B
 
-    a = cute.recast_tensor(a, Int32)
-    b = cute.recast_tensor(b, Int32)
+    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
+    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
 
     out = llvm.inline_asm(
         llvm.StructType.get_literal([mlir_ty] * 4),
@@ -88,7 +84,7 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
         ip=ip,
     )
     vec = vector.from_elements(
-        ir.VectorType.get([4], mlir_ty, loc=loc),
+        ir.VectorType.get([4], mlir_ty, loc=loc, ip=ip),
         [llvm.extractvalue(mlir_ty, out, [i], loc=loc, ip=ip) for i in range(4)],
         loc=loc,
         ip=ip,

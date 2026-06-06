@@ -33,6 +33,11 @@ def make_idesc_mxfp8(MMA_M: int, MMA_N: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def make_idesc_nvfp4(MMA_M: int, MMA_N: int, *, loc=None, ip=None):
+    return Uint32((1 << 7) | (1 << 10) | (MMA_N >> 3 << 17) | (MMA_M >> 7 << 27))
+
+
+@dsl_user_op
 def make_sdesc_128B(*, loc=None, ip=None):
     return Uint64(((8 * 128) >> 4 << 32) | (1 << 46) | (2 << 61))
 
@@ -109,6 +114,36 @@ def mma_mxfp8(
         _make_tmem_llvm_ptr(sfa_tmem, loc=loc, ip=ip),
         _make_tmem_llvm_ptr(sfb_tmem, loc=loc, ip=ip),
         scale_vec_size=nvvm.Tcgen05MMAScaleVecSize.X1,  # BLOCK32 doesn't work
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mma_nvfp4(
+    d_tmem,
+    a_desc,
+    b_desc,
+    idesc,
+    sfa_tmem,
+    sfb_tmem,
+    enable_input_d,
+    cta_group: int = 1,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    nvvm.tcgen05_mma_block_scale(
+        nvvm.Tcgen05MMAKind.MXF4NVF4,
+        CTA_GROUP_MAP[cta_group],
+        _make_tmem_llvm_ptr(d_tmem, loc=loc, ip=ip),
+        Uint64(a_desc).ir_value(loc=loc, ip=ip),
+        Uint64(b_desc).ir_value(loc=loc, ip=ip),
+        Uint32(idesc).ir_value(loc=loc, ip=ip),
+        Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
+        _make_tmem_llvm_ptr(sfa_tmem, loc=loc, ip=ip),
+        _make_tmem_llvm_ptr(sfb_tmem, loc=loc, ip=ip),
+        scale_vec_size=nvvm.Tcgen05MMAScaleVecSize.X4,
         loc=loc,
         ip=ip,
     )

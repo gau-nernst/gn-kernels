@@ -3,7 +3,7 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int32, Int64, Uint16, Uint64, cute
+from cutlass import BFloat16, Float4E2M1FN, Float8E4M3FN, Int32, Int64, Uint16, Uint64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_tensor
 from cutlass.utils import get_smem_capacity_in_bytes
@@ -11,14 +11,14 @@ from cutlass.utils import get_smem_capacity_in_bytes
 from .utils import _tcgen05, mbarrier, simple_tma_g2s, to_cta0_smem
 
 
-class MatmulMXFP8Sm100:
+class MatmulNVFP4Sm100:
     def __init__(self, BN: int, cta_group: int) -> None:
-        BM, BK = 128, 128
+        BM, BK = 128, 256
         self.cta_tile = (BM, BN, BK)
         self.cta_group = cta_group
 
         smem_bytes = get_smem_capacity_in_bytes()
-        self.stage_size = (BM + (BN // cta_group)) * BK + (BM + BN) * (BK // 32)
+        self.stage_size = (BM + (BN // cta_group)) * (BK // 2) + (BM + BN) * (BK // 16)
         self.num_stages = smem_bytes // self.stage_size
 
     @cute.jit
@@ -72,8 +72,8 @@ class MatmulMXFP8Sm100:
 
         A_args = self.prepare_AB(A, BM, BK)
         B_args = self.prepare_AB(B, BN // self.cta_group, BK)
-        SFA_args = self.prepare_SF(SFA, M, K // 32, BM, BK // 32)
-        SFB_args = self.prepare_SF(SFB, N, K // 32, BN, BK // 32)
+        SFA_args = self.prepare_SF(SFA, M, K // 16, BM, BK // 16)
+        SFB_args = self.prepare_SF(SFB, N, K // 16, BN, BK // 16)
 
         self.kernel(A_args, B_args, SFA_args, SFB_args, C).launch(
             grid=(128, 1, 1),
@@ -110,8 +110,8 @@ class MatmulMXFP8Sm100:
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
-        sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        sA = smem.allocate_tensor(Float4E2M1FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
+        sB = smem.allocate_tensor(Float4E2M1FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
         sSFA = smem.allocate_tensor(Int64, sSFA_layout, byte_alignment=128)
         sSFB = smem.allocate_tensor(Int64, sSFB_layout, byte_alignment=128)
 
@@ -161,8 +161,8 @@ class MatmulMXFP8Sm100:
             # select gmem tile
             gA_tiles = cute.zipped_divide(A_tma_tensor, (BM, BK))  # [(BM, BK), (M/BM, K/BK)]
             gB_tiles = cute.zipped_divide(B_tma_tensor, (BN // cta_group, BK))
-            gSFA_tiles = cute.zipped_divide(SFA_tma_tensor, (128 * (BK // 32) // 8, BM // 128))
-            gSFB_tiles = cute.zipped_divide(SFB_tma_tensor, (128 * (BK // 32) // 8, BN // 128))
+            gSFA_tiles = cute.zipped_divide(SFA_tma_tensor, (128 * (BK // 16) // 8, BM // 128))
+            gSFB_tiles = cute.zipped_divide(SFB_tma_tensor, (128 * (BK // 16) // 8, BN // 128))
 
             for bid in range(raw_bid, grid_m * grid_n, num_bids):
                 bid_m = bid // (grid_n * 2) * 2 + bid % 2
@@ -196,24 +196,22 @@ class MatmulMXFP8Sm100:
                 tmem_empty_parity = 1
                 partial_parity = 0
 
+                MMA_M = BM * cta_group
+                MMA_N = BN
+                idesc = _tcgen05.make_idesc_nvfp4(MMA_M, MMA_N)
+
                 sdesc = _tcgen05.make_sdesc_128B()
                 sdesc_sf = Uint64(((8 * 16) >> 4 << 32) | (1 << 46))  # SBO=8*16
                 multicast_mask = Uint16((1 << cta_group) - 1)
 
                 for bid in range(raw_bid, grid_m * grid_n, num_bids):
                     # we only have 512 tmem columns. when BN=256, d_tmem across
-                    # 2 stages need to overlap 16 columns, leaving the remaning
-                    # 16 columns for SFA+SFB.
+                    # 2 stages need to overlap 64 columns, leaving the remaning
+                    # 64 columns for SFA+SFB.
                     #   d_tmem (stage0): [  0, 256]
-                    #   d_tmem (stage1): [240, 496]
-                    #   sf_tmem        : [496, 512]
-                    #
-                    # for a [128,128] A or B tile, its corresponding SF tile is [128,4]
-                    # NVIDIA layout permutes it as [32,4][32,4][32,4][32,4]
-                    # hence, a single tcgen05.cp.32x128b is enough to cover 1 [128,128] tile.
-                    d_tmem = tmem_stage * 240
-                    sfa_tmem = 496
-                    sfb_tmem = sfa_tmem + 4
+                    #   d_tmem (stage1): [192, 448]
+                    #   sf_tmem        : [448, 512]
+                    d_tmem = tmem_stage * 192
 
                     cute.arch.mbarrier_wait(tmem_empty_mbar + tmem_stage, tmem_empty_parity)
                     _tcgen05.fence_after_thread_sync()
@@ -224,27 +222,35 @@ class MatmulMXFP8Sm100:
                         sfa_desc = sdesc_sf | (sSFA[None, None, tma_stage].iterator.toint() >> 4)
                         sfb_desc = sdesc_sf | (sSFB[None, None, tma_stage].iterator.toint() >> 4)
 
-                        MMA_M = BM * cta_group
-                        MMA_N = BN
-                        idesc = _tcgen05.make_idesc_mxfp8(MMA_M, MMA_N)
+                        sfa_tmem = 448
+                        sfb_tmem = sfa_tmem + 16
 
                         cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, tma_full_parity)
                         _tcgen05.fence_after_thread_sync()
 
                         with cute.arch.elect_one():
-                            _tcgen05.cp(sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group)
-                            for j in cutlass.range_constexpr(BN // 128):
-                                _tcgen05.cp(sfb_tmem + j * 4, sfb_desc, "32x128b", "warpx4", cta_group)
-                                sfb_desc += (128 * 4) >> 4
+                            for k in cutlass.range_constexpr(BK // 64):
+                                _tcgen05.cp(sfa_tmem, sfa_desc, "32x128b", "warpx4", cta_group)
+                                for j in cutlass.range_constexpr(BN // 128):
+                                    _tcgen05.cp(
+                                        sfb_tmem + j * 4,
+                                        sfb_desc + ((128 * (BK // 16) * j) >> 4),
+                                        "32x128b",
+                                        "warpx4",
+                                        cta_group,
+                                    )
 
-                            for k in cutlass.range_constexpr(BK // 32):
                                 enable_input_d = iter_k > 0 or k > 0
-                                _tcgen05.mma_mxfp8(
+                                _tcgen05.mma_nvfp4(
                                     d_tmem, a_desc, b_desc, idesc, sfa_tmem, sfb_tmem, enable_input_d, cta_group
                                 )
                                 a_desc += 32 >> 4
                                 b_desc += 32 >> 4
-                                idesc += (1 << 4) | (1 << 29)  # increment SF ID
+                                sfa_tmem += 4
+                                sfb_tmem += 4 * (BN // 128)
+                                sfa_desc += (128 * 4) >> 4
+                                sfb_desc += (128 * 4) >> 4
+
                             _tcgen05.commit(tma_empty_mbar + tma_stage, multicast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % num_stages
@@ -299,7 +305,7 @@ class MatmulMXFP8Sm100:
 
                 if cutlass.const_expr(BN == 128):
                     for i in cutlass.range_constexpr(BN // WIDTH):
-                        tcol = tmem_stage * 240 + i * WIDTH
+                        tcol = tmem_stage * 192 + i * WIDTH
                         regs = _tcgen05.ld(warp_id * 32, tcol, "32x32b", WIDTH)
                         _tcgen05.wait_ld()
 
@@ -315,28 +321,29 @@ class MatmulMXFP8Sm100:
                         cute.copy(bf16x16_atom, tmp, C_[None, coord])
 
                 elif cutlass.const_expr(BN == 256):
-                    # always load [240,256] tmem columns first
-                    regs = _tcgen05.ld(warp_id * 32, 240, "32x32b", 16)
+                    # always load [192,256] tmem columns first
+                    regs = _tcgen05.ld(warp_id * 32, 192, "32x32b", 64)
                     _tcgen05.wait_ld()
                     _tcgen05.fence_before_thread_sync()
                     mbarrier.arrive(partial_mbar_, "cluster")
 
-                    tmp = cute.make_rmem_tensor(16, BFloat16)
+                    tmp = cute.make_rmem_tensor((16, 4), BFloat16)
                     tmp.store(regs.to(BFloat16))
 
                     # C_ shape: (WIDTH, (M, N/WIDTH))
-                    coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + (BN // WIDTH - 1) * (1 - tmem_stage))
-                    cute.copy(bf16x16_atom, tmp, C_[None, coord])
+                    for i in cutlass.range_constexpr(4):
+                        coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + (BN // WIDTH - 4) * (1 - tmem_stage) + i)
+                        cute.copy(bf16x16_atom, tmp[None, i], C_[None, coord])
 
                     # load the remaining
-                    #   tmem_stage=0: [  0,240]
-                    #   tmem_stage=1: [256,496]
-                    for i in cutlass.range_constexpr(BN // WIDTH - 1):
+                    #   tmem_stage=0: [  0,192]
+                    #   tmem_stage=1: [256,448]
+                    for i in cutlass.range_constexpr(BN // WIDTH - 4):
                         tcol = tmem_stage * 256 + i * WIDTH
                         regs = _tcgen05.ld(warp_id * 32, tcol, "32x32b", WIDTH)
                         _tcgen05.wait_ld()
 
-                        if cutlass.const_expr(i == BN // WIDTH - 2):
+                        if cutlass.const_expr(i == BN // WIDTH - 5):
                             _tcgen05.fence_before_thread_sync()
                             mbarrier.arrive(tmem_empty_mbar_ + tmem_stage, "cluster")
 
@@ -344,7 +351,7 @@ class MatmulMXFP8Sm100:
                         tmp.store(regs.to(BFloat16))
 
                         # C_ shape: (WIDTH, (M, N/WIDTH))
-                        coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + tmem_stage + i)
+                        coord = (bid_m * BM + tid, bid_n * (BN // WIDTH) + 4 * tmem_stage + i)
                         cute.copy(bf16x16_atom, tmp, C_[None, coord])
 
                 tmem_stage = (tmem_stage + 1) % 2
@@ -364,20 +371,20 @@ class MatmulMXFP8Sm100:
     def compile(BN: int, cta_group: int):
         M = cute.sym_int()
         N = cute.sym_int()
-        K = cute.sym_int()
+        K = cute.sym_int(divisibility=2)
 
-        A = make_fake_tensor(Float8E4M3FN, (M, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        B = make_fake_tensor(Float8E4M3FN, (N, K), (cute.sym_int64(divisibility=8), 1), assumed_align=16)
-        SFA = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
-        SFB = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
+        A = make_fake_tensor(Float4E2M1FN, (M, K), (cute.sym_int64(divisibility=16), 1), assumed_align=16)
+        B = make_fake_tensor(Float4E2M1FN, (N, K), (cute.sym_int64(divisibility=16), 1), assumed_align=16)
+        SFA = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
+        SFB = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = MatmulMXFP8Sm100(BN, cta_group)
+        kernel = MatmulNVFP4Sm100(BN, cta_group)
         return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
 
 def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    MatmulMXFP8Sm100.compile(256, 2)(A, B, SFA.view(-1), SFB.view(-1), C)
+    MatmulNVFP4Sm100.compile(256, 2)(A, B, SFA.view(-1), SFB.view(-1), C)
     return C
