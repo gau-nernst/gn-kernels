@@ -1,28 +1,33 @@
+import cutlass
 import torch
-from cutlass import BFloat16, Float16, Float32, Int8, Int32, Uint8, Uint32, cute
+from cutlass import cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 
 TORCH_TO_CUTE_DTYPE = {
-    torch.float32: Float32,
-    torch.bfloat16: BFloat16,
-    torch.float16: Float16,
-    torch.int8: Int8,
-    torch.uint8: Uint8,
-    torch.int32: Int32,
-    torch.uint32: Uint32,
+    torch.float32: cutlass.Float32,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
+    torch.int8: cutlass.Int8,
+    torch.uint8: cutlass.Uint8,
+    torch.int32: cutlass.Int32,
+    torch.uint32: cutlass.Uint32,
 }
 
 CUTE_TO_PTX_DTYPE = {
-    Float32: "f32",
-    BFloat16: "bf16",
-    Float16: "f16",
-    Int8: "s8",
-    Uint8: "u8",
-    Int32: "s32",
-    Uint32: "u32",
+    cutlass.Float32: "f32",
+    cutlass.BFloat16: "bf16",
+    cutlass.Float16: "f16",
+    cutlass.Float8E4M3FN: "e4m3",
+    cutlass.Float8E5M2: "e5m2",
+    cutlass.Int8: "s8",
+    cutlass.Uint8: "u8",
+    cutlass.Int32: "s32",
+    cutlass.Uint32: "u32",
 }
 
 
@@ -61,20 +66,21 @@ def permute(x: cute.Tensor, dims: tuple[int, ...], *, loc=None, ip=None):
 
 @dsl_user_op
 def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=None):
-    ab_ty = CUTE_TO_PTX_DTYPE[a.element_type]
+    a_ty = CUTE_TO_PTX_DTYPE[a.element_type]
+    b_ty = CUTE_TO_PTX_DTYPE[b.element_type]
     c_ty = CUTE_TO_PTX_DTYPE[c.element_type]
     mlir_ty = c.element_type.mlir_type
     K = 256 // a.element_type.width  # 32B
 
-    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
-    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
+    a = cute.recast_tensor(a, cutlass.Int32, loc=loc, ip=ip)
+    b = cute.recast_tensor(b, cutlass.Int32, loc=loc, ip=ip)
 
     out = llvm.inline_asm(
         llvm.StructType.get_literal([mlir_ty] * 4),
         [a[i].ir_value(loc=loc, ip=ip) for i in range(4)]
         + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)],
-        f"mma.sync.aligned.m16n8k{K}.row.col.{c_ty}.{ab_ty}.{ab_ty}.{c_ty} "
+        f"mma.sync.aligned.m16n8k{K}.row.col.{c_ty}.{a_ty}.{b_ty}.{c_ty} "
         "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, "
         "{$10, $11, $12, $13};",
         "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
@@ -84,9 +90,9 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
         ip=ip,
     )
     vec = vector.from_elements(
-        ir.VectorType.get([4], mlir_ty, loc=loc, ip=ip),
+        ir.VectorType.get([4], mlir_ty, loc=loc),
         [llvm.extractvalue(mlir_ty, out, [i], loc=loc, ip=ip) for i in range(4)],
         loc=loc,
         ip=ip,
     )
-    return cute.TensorSSA(vec, 4, Float32)
+    return cute.TensorSSA(vec, 4, c.element_type)

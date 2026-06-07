@@ -11,7 +11,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 from .utils import _tcgen05, mbarrier, simple_tma_g2s, to_cta0_smem
 
 
-class MatmulMXFP8Sm100:
+class Sm100MatmulMXFP8:
     def __init__(self, BN: int, cta_group: int) -> None:
         BM, BK = 128, 128
         self.cta_tile = (BM, BN, BK)
@@ -371,11 +371,11 @@ class MatmulMXFP8Sm100:
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = MatmulMXFP8Sm100(BN, cta_group)
+        kernel = Sm100MatmulMXFP8(BN, cta_group)
         return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
 
 def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    MatmulMXFP8Sm100.compile(256, 2)(A, B, SFA.view(-1), SFB.view(-1), C)
+    Sm100MatmulMXFP8.compile(256, 2)(A, B, SFA.view(-1), SFB.view(-1), C)
     return C
