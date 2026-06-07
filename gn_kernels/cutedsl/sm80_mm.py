@@ -107,9 +107,10 @@ class Sm80Matmul:
 
         # registers
         # let ptxas decides register reuse for rA and rB
+        MMA_K = 32 // (dtype.width // 8)  # 32B
         acc_dtype = Int32 if dtype is Int8 else Float32
-        rA = cute.make_rmem_tensor((elems, WM // 16, BK // 16), dtype)
-        rB = cute.make_rmem_tensor(((elems // 2, 2), WN // 16, BK // 16), dtype)
+        rA = cute.make_rmem_tensor((elems, WM // 16, BK // MMA_K), dtype)
+        rB = cute.make_rmem_tensor(((elems // 2, 2), WN // 16, BK // MMA_K), dtype)
         rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), acc_dtype)
         rC.fill(0.0)
 
@@ -136,7 +137,6 @@ class Sm80Matmul:
             cute.arch.cp_async_wait_group(num_stages - 1)
             cute.arch.sync_threads()
 
-            MMA_K = 32 // (dtype.width // 8)  # 32B
             for k in cutlass.range_constexpr(BK // MMA_K):
                 cute.copy(ldsm_atom, sA_ldsm[None, (None, k, compute_stage)], rA[None, None, k])
                 cute.copy(ldsm_atom, sB_ldsm[None, (None, k, compute_stage)], rB[None, None, k])

@@ -176,7 +176,7 @@ def mma_sync_nvfp4(
         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)]
         + [SFA.ir_value(loc=loc, ip=ip), byte_id_A.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
         + [SFB.ir_value(loc=loc, ip=ip), byte_id_B.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
-        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e4m3.e4m3.f32.ue4m3 "
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
         "{$0, $1, $2, $3}, "
         "{$4, $5, $6, $7}, "
         "{$8, $9}, "

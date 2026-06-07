@@ -31,7 +31,7 @@ class Sm120MatmulMXFP8:
     def prepare_SF(self, SF: cute.Tensor, M: Int32, K: Int32):
         # NVIDIA SF layout in gmem
         # if SF has shape [M, Ksf], it's permuted as [M/128, Ksf/4, 32, 4, 4]
-        g_layout = cute.make_layout(((4, 4, 32), K // 128, M // 128))
+        g_layout = cute.make_layout((512, K // 128, M // 128))
         return cute.make_tensor(SF.iterator, g_layout)
 
     @cute.jit
@@ -81,15 +81,12 @@ class Sm120MatmulMXFP8:
 
         _, K = A_tma_tensor.shape
 
-        # for SF TMA
-        op = cpasync.CopyBulkG2SOp()
-        sf_tma_atom = cute.make_copy_atom(op, Float8E8M0FNU, num_bits_per_copy=512 * 8)
-        sf_slayout = cute.make_layout(((4, 4, 32), num_stages))
-
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+
+        sf_slayout = cute.make_layout(((4, 4, 32), num_stages))
         sSFA = smem.allocate_tensor(Float8E8M0FNU, sf_slayout, byte_alignment=128)
         sSFB = smem.allocate_tensor(Float8E8M0FNU, sf_slayout, byte_alignment=128)
 
@@ -111,6 +108,10 @@ class Sm120MatmulMXFP8:
             # TMA warp
             tma_stage = 0
             parity = 1
+
+            # for SF TMA
+            op = cpasync.CopyBulkG2SOp()
+            sf_tma_atom = cute.make_copy_atom(op, Float8E8M0FNU, num_bits_per_copy=512 * 8)
 
             # select gmem tile
             gA_tiles = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
@@ -155,8 +156,9 @@ class Sm120MatmulMXFP8:
 
             # pre-compute ldmatrix address (16x16 tile)
             # ((16, (16B, 2), 1), (WM/16, BK/32B, num_stages))
-            sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((16, 2)), 1))
-            sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((16, 2)), 1))
+            elems = 16  # 16B
+            sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((elems, 2)), 1))
+            sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((elems, 2)), 1))
 
             # select the address
             # (16B, (WM/16, BK/32B, num_stages))
@@ -183,8 +185,9 @@ class Sm120MatmulMXFP8:
 
             # registers
             # let ptxas decides register reuse for rA and rB
-            rA = cute.make_rmem_tensor((16, WM // 16, BK // 16), Float8E4M3FN)
-            rB = cute.make_rmem_tensor(((8, 2), WN // 16, BK // 16), Float8E4M3FN)
+            MMA_K = 32  # 32B
+            rA = cute.make_rmem_tensor((16, WM // 16, BK // MMA_K), Float8E4M3FN)
+            rB = cute.make_rmem_tensor(((8, 2), WN // 16, BK // MMA_K), Float8E4M3FN)
             rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
             rC.fill(0.0)
 
@@ -200,7 +203,6 @@ class Sm120MatmulMXFP8:
                 cute.copy(sf_s2r_atom, sSFA_view[None, tma_stage], rSFA)
                 cute.copy(sf_s2r_atom, sSFB_view[None, tma_stage], rSFB)
 
-                MMA_K = 32  # 32B
                 for k in cutlass.range_constexpr(BK // MMA_K):
                     cute.copy(ldsm_atom, sA_ldsm[None, (None, k, tma_stage)], rA[None, None, k])
                     cute.copy(ldsm_atom, sB_ldsm[None, (None, k, tma_stage)], rB[None, None, k])
