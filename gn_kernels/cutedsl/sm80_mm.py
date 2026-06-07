@@ -7,6 +7,7 @@ from cuda.bindings.driver import CUstream
 from cutlass import Float32, Int8, Int32, cute
 from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from torch import Tensor
 
 from .utils import TORCH_TO_CUTE_DTYPE, mma_sync
@@ -141,9 +142,8 @@ class Sm80Matmul:
                 cute.copy(ldsm_atom, sB_ldsm[None, (None, k, compute_stage)], rB[None, None, k])
 
                 for m in cutlass.range_constexpr(WM // 16):
-                    for n in cutlass.range_constexpr(WN // 16):
-                        rC[None, n * 2 + 0, m] = mma_sync(rA[None, m, k], rB[(None, 0), n, k], rC[None, n * 2 + 0, m])
-                        rC[None, n * 2 + 1, m] = mma_sync(rA[None, m, k], rB[(None, 1), n, k], rC[None, n * 2 + 1, m])
+                    for n in cutlass.range_constexpr(WN // 8):
+                        rC[None, n, m] = mma_sync(rA[None, m, k], rB[(None, n % 2), n // 2, k], rC[None, n, m])
 
             compute_stage = (compute_stage + 1) % num_stages
 
@@ -205,11 +205,11 @@ class Sm80Matmul:
         N = cute.sym_int()
         K = cute.sym_int()
 
-        A = cute.runtime.make_fake_tensor(AB_dtype, (M, K), (cute.sym_int64(16), 1), assumed_align=16)
-        B = cute.runtime.make_fake_tensor(AB_dtype, (N, K), (cute.sym_int64(16), 1), assumed_align=16)
-        C = cute.runtime.make_fake_tensor(C_dtype, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
+        A = make_fake_tensor(AB_dtype, (M, K), (cute.sym_int64(16), 1), assumed_align=16)
+        B = make_fake_tensor(AB_dtype, (N, K), (cute.sym_int64(16), 1), assumed_align=16)
+        C = make_fake_tensor(C_dtype, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
 
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm80Matmul()
         return cute.compile(kernel, A, B, C, stream, options="--enable-tvm-ffi")
 

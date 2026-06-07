@@ -24,7 +24,7 @@ Available kernels
 - CuteDSL:
   - SM80/SM89 matmul (`cp.async` + `mma.sync`): BF16, INT8, FP8
   - SM100 matmul (TMA + `tcgen05`): BF16, MXFP8, NVFP4
-  - SM120 matmul (TMA + `mma.sync`): BF16, INT8, FP8
+  - SM120 matmul (TMA + `mma.sync`): BF16, INT8, FP8, MXFP8
 
 ## Speed benchmarks
 

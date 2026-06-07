@@ -1,6 +1,6 @@
 import cutlass
 import torch
-from cutlass import cute
+from cutlass import Int16, Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
@@ -74,8 +74,8 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
     mlir_ty = c.element_type.mlir_type
     K = 256 // a.element_type.width  # 32B
 
-    a = cute.recast_tensor(a, cutlass.Int32, loc=loc, ip=ip)
-    b = cute.recast_tensor(b, cutlass.Int32, loc=loc, ip=ip)
+    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
+    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
 
     out = llvm.inline_asm(
         llvm.StructType.get_literal([mlir_ty] * 4),
@@ -83,9 +83,107 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
         + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)],
         f"mma.sync.aligned.m16n8k{K}.row.col.{c_ty}.{a_ty}.{b_ty}.{c_ty} "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, "
+        "{$0, $1, $2, $3}, "
+        "{$4, $5, $6, $7}, "
+        "{$8, $9}, "
         "{$10, $11, $12, $13};",
         "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    vec = vector.from_elements(
+        ir.VectorType.get([4], mlir_ty, loc=loc),
+        [llvm.extractvalue(mlir_ty, out, [i], loc=loc, ip=ip) for i in range(4)],
+        loc=loc,
+        ip=ip,
+    )
+    return cute.TensorSSA(vec, 4, c.element_type)
+
+
+@dsl_user_op
+def mma_sync_mxfp8(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    SFA: Int32,
+    byte_id_A: Int16,
+    thread_id_A: Int16,
+    SFB: Int32,
+    byte_id_B: Int16,
+    thread_id_B: Int16,
+    *,
+    loc=None,
+    ip=None,
+):
+    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
+    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
+
+    mlir_ty = cutlass.Float32.mlir_type
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_ty] * 4),
+        [a[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+        + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
+        + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+        + [SFA.ir_value(loc=loc, ip=ip), byte_id_A.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
+        + [SFB.ir_value(loc=loc, ip=ip), byte_id_B.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
+        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0 "
+        "{$0, $1, $2, $3}, "
+        "{$4, $5, $6, $7}, "
+        "{$8, $9}, "
+        "{$10, $11, $12, $13}, "
+        "$14, {$15, $16}, "
+        "$17, {$18, $19};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,h,h,r,h,h",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    vec = vector.from_elements(
+        ir.VectorType.get([4], mlir_ty, loc=loc),
+        [llvm.extractvalue(mlir_ty, out, [i], loc=loc, ip=ip) for i in range(4)],
+        loc=loc,
+        ip=ip,
+    )
+    return cute.TensorSSA(vec, 4, c.element_type)
+
+
+@dsl_user_op
+def mma_sync_nvfp4(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    SFA: Int32,
+    byte_id_A: Int16,
+    thread_id_A: Int16,
+    SFB: Int32,
+    byte_id_B: Int16,
+    thread_id_B: Int16,
+    *,
+    loc=None,
+    ip=None,
+):
+    a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
+    b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
+
+    mlir_ty = cutlass.Float32.mlir_type
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_ty] * 4),
+        [a[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+        + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
+        + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+        + [SFA.ir_value(loc=loc, ip=ip), byte_id_A.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
+        + [SFB.ir_value(loc=loc, ip=ip), byte_id_B.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e4m3.e4m3.f32.ue4m3 "
+        "{$0, $1, $2, $3}, "
+        "{$4, $5, $6, $7}, "
+        "{$8, $9}, "
+        "{$10, $11, $12, $13}, "
+        "$14, {$15, $16}, "
+        "$17, {$18, $19};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,h,h,r,h,h",
         has_side_effects=False,
         is_align_stack=False,
         loc=loc,

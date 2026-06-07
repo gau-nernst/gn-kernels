@@ -5,7 +5,7 @@ import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float4E2M1FN, Float8E4M3FN, Int32, Int64, Uint16, Uint64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import make_fake_tensor
+from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from cutlass.utils import get_smem_capacity_in_bytes
 
 from .utils import _tcgen05, mbarrier, simple_tma_g2s, to_cta0_smem
@@ -129,15 +129,16 @@ class Sm100MatmulNVFP4:
         grid_n = cute.ceil_div(N, BN)
 
         if warp_id == 0:
-            for i in cutlass.range_constexpr(num_stages):
-                cute.arch.mbarrier_init(tma_full_mbar + i, cta_group)
-                cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
-            for i in cutlass.range_constexpr(2):
-                cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
-                cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * cta_group)
-            if cutlass.const_expr(BN == 256):
-                cute.arch.mbarrier_init(partial_mbar, 128 * cta_group)
-            cute.arch.mbarrier_init_fence()
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(num_stages):
+                    cute.arch.mbarrier_init(tma_full_mbar + i, cta_group)
+                    cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
+                for i in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * cta_group)
+                if cutlass.const_expr(BN == 256):
+                    cute.arch.mbarrier_init(partial_mbar, 128 * cta_group)
+                cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
             cpasync.prefetch_descriptor(A_tma_atom)
             cpasync.prefetch_descriptor(B_tma_atom)
@@ -371,13 +372,13 @@ class Sm100MatmulNVFP4:
         N = cute.sym_int()
         K = cute.sym_int(divisibility=2)
 
-        A = make_fake_tensor(Float4E2M1FN, (M, K), (cute.sym_int64(divisibility=16), 1), assumed_align=16)
-        B = make_fake_tensor(Float4E2M1FN, (N, K), (cute.sym_int64(divisibility=16), 1), assumed_align=16)
+        A = make_fake_tensor(Float4E2M1FN, (M, K), (cute.sym_int64(divisibility=32), 1), assumed_align=16)
+        B = make_fake_tensor(Float4E2M1FN, (N, K), (cute.sym_int64(divisibility=32), 1), assumed_align=16)
         SFA = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
         SFB = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int(divisibility=16), 1), assumed_align=32)
 
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm100MatmulNVFP4(BN, cta_group)
         return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
