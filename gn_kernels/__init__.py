@@ -3,27 +3,12 @@ from pathlib import Path
 import torch
 
 from .attn import attn_int8, attn_int8_qk, attn_mxfp8_qk
-from .cutlass_mm import (
-    cutlass_fp8_mm,
-    cutlass_int4_mm,
-    cutlass_mxfp4_mm,
-    cutlass_nvfp4_mm,
-    cutlass_row_scaled_fp8_mm,
-    cutlass_row_scaled_int4_mm,
-)
 from .triton_attn import triton_attn
-from .triton_mm import triton_block2d_scaled_mm, triton_mm
+from .triton_mm import triton_mm
 from .utils import FP4_DTYPE, dequantize_mx, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
 
 __all__ = [
-    "cutlass_int4_mm",
-    "cutlass_row_scaled_int4_mm",
-    "cutlass_row_scaled_fp8_mm",
-    "cutlass_fp8_mm",
-    "cutlass_mxfp4_mm",
-    "cutlass_nvfp4_mm",
     "triton_mm",
-    "triton_block2d_scaled_mm",
     "triton_attn",
     "triton_scaled_qk_attn",
     "attn_int8",

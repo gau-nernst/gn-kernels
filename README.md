@@ -11,12 +11,6 @@ uv pip install git+https://github.com/gau-nernst/gn_kernels --no-build-isolation
 
 Available kernels
 
-- Cutlass
-  - Cutlass 2.x:
-    - SM80: INT4 mm and row-scaled mm
-    - SM89: FP8 mm and row-scaled mm
-  - Cutlass 3.x:
-    - SM120: FP8/FP4 mm and row-scaled mm
 - Triton
   - Matmul with various input dtypes, FP16 accumulation, row-scaled and 2d-block-scaled (DeepSeek)
   - Attention:
@@ -25,8 +19,10 @@ Available kernels
     - Optional QK and PV with FP16 accumulation
     - TODO: varlen, paged
 - CUDA
-  - Matmul with various input dtypes and FP16 accumulation
+  - (NVRTC) Matmul with various input dtypes and FP16 accumulation
   - Attention: optional QK with INT8/FP8 MMA
+- CuteDSL:
+  - SM100 matmul: BF16, MXFP8, NVFP4
 
 ## Speed benchmarks
 
@@ -48,7 +44,7 @@ Note: INT8 matmul implementation I'm using on MI300x is probably not good.
 
 ### Matmul
 
-RTX 5090 TFLOPS @ 400W. See [`benchmark_mm.py`](benchmark_mm.py) (might need better configs for FP16. Use default Cutlass INT4 GEMM)
+RTX 5090 TFLOPS @ 400W. See [`benchmark_mm.py`](benchmark_mm.py) (might need better configs for FP16)
 - `torch==2.8.0`
 - `pytorch-triton==3.4.0+git11ec6354`
 
@@ -61,17 +57,9 @@ Note:
 | PyTorch (CuBLAS) BF16             |  87.38 | 167.77 |  176.99 |         209.5 |
 | Triton FP16 w/ FP16 accumulate    | 149.8  | 288.95 |  273.77 |         419   |
 | Triton FP8                        | 116.71 | 190.58 |  217.19 |         419   |
-| Cutlass FP8                       | 116.11 | 310.33 |  383.41 |         419   |
 | PyTorch (CuBLAS) INT8             | 209.72 | 466.03 |  593.8  |         838   |
 | Triton INT8                       | 173.41 | 466.03 |  524.29 |         838   |
-| Cutlass INT4                      |  18.08 |  73.58 |   74.73 |           0   |
 | Inductor (Triton) row-scaled FP8  | 116.51 | 189.77 |  214.27 |         419   |
 | Triton row-scaled FP8             | 116.11 | 190.45 |  216.83 |         419   |
-| Cutlass row-scaled FP8            | 116.51 | 310.15 |  387.6  |         419   |
-| Triton block2d-scaled FP8         |  69.91 | 161.22 |  192.85 |         419   |
 | Inductor (Triton) row-scaled INT8 | 149.46 | 400.35 |  520.22 |         838   |
 | Triton row-scaled INT8            | 173.41 | 493.45 |  541.41 |         838   |
-| Triton block2d-scaled INT8        | 148.8  | 381.03 |  453.44 |         838   |
-| Cutlass row-scaled INT4           |  17.72 |  72.91 |   73.86 |           0   |
-| Cutlass MXFP4                     | 209.72 | 709.21 | 1099.58 |        1676   |
-| Cutlass NVFP4                     | 209.72 | 699.05 | 1100.43 |        1676   |
