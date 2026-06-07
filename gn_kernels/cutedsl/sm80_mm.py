@@ -86,25 +86,19 @@ class Sm80Matmul:
         # warp partition
         # shape: (WM, BK, num_stages)
         # (well, the 2nd mode, is actually (width,BK/width). but to simplify the expresion...)
-        sA_warp = cute.logical_divide(sA, (WM, None, None))[(None, warp_id_m), None, None]
-        sB_warp = cute.logical_divide(sB, (WN, None, None))[(None, warp_id_n), None, None]
+        sA_warp = cute.local_tile(sA, (WM, BK, num_stages), (warp_id_m, 0, 0))
+        sB_warp = cute.local_tile(sB, (WN, BK, num_stages), (warp_id_n, 0, 0))
 
         # pre-compute ldmatrix address (16x16 tile)
-        # bring ldsm elems in front
-        # (8, (WM,BK/8,num_stages))
+        # ((16, (16B, 2), 1), (WM/16, BK/32B, num_stages))
         elems = 128 // dtype.width  # elements to cover 16B row
-        sA_ldsm = cute.zipped_divide(sA_warp, (1, elems, 1))[(0, None, 0), None]
-        sB_ldsm = cute.zipped_divide(sB_warp, (1, elems, 1))[(0, None, 0), None]
-
-        # partition to (16,16) tiles (appear as (16,2) lane tiles)
-        # (8, ((16,WM/16), (2,BK/16), num_stages))
-        sA_ldsm = cute.logical_divide(sA_ldsm, (None, (16, 2, None)))
-        sB_ldsm = cute.logical_divide(sB_ldsm, (None, (16, 2, None)))
+        sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((elems, 2)), 1))
+        sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((elems, 2)), 1))
 
         # select the address
-        # (8, WM/16, BK/16, num_stages)
-        sA_ldsm = sA_ldsm[None, ((lane_id % 16, None), (lane_id // 16, None), None)]
-        sB_ldsm = sB_ldsm[None, (((lane_id // 16) * 8 + (lane_id % 8), None), ((lane_id // 8) % 2, None), None)]
+        # (16B, (WM/16, BK/32B, num_stages))
+        sA_ldsm = sA_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
+        sB_ldsm = sB_ldsm[((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2), 0), None]
 
         # ldmatrix.x4
         ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
@@ -143,8 +137,8 @@ class Sm80Matmul:
 
             MMA_K = 32 // (dtype.width // 8)  # 32B
             for k in cutlass.range_constexpr(BK // MMA_K):
-                cute.copy(ldsm_atom, sA_ldsm[None, None, k, compute_stage], rA[None, None, k])
-                cute.copy(ldsm_atom, sB_ldsm[None, None, k, compute_stage], rB[None, None, k])
+                cute.copy(ldsm_atom, sA_ldsm[None, (None, k, compute_stage)], rA[None, None, k])
+                cute.copy(ldsm_atom, sB_ldsm[None, (None, k, compute_stage)], rB[None, None, k])
 
                 for m in cutlass.range_constexpr(WM // 16):
                     for n in cutlass.range_constexpr(WN // 16):
