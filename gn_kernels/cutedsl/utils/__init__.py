@@ -66,6 +66,8 @@ def permute(x: cute.Tensor, dims: tuple[int, ...], *, loc=None, ip=None):
 
 @dsl_user_op
 def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=None):
+    # CuteDSL has nvvm.mma_sync(), but it doesn't export nvvm's MMA shape.
+    # hence we have to use PTX.
     a_ty = CUTE_TO_PTX_DTYPE[a.element_type]
     b_ty = CUTE_TO_PTX_DTYPE[b.element_type]
     c_ty = CUTE_TO_PTX_DTYPE[c.element_type]

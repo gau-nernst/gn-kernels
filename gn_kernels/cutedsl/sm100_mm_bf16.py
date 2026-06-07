@@ -71,6 +71,7 @@ class Sm100MatmulBF16:
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(BFloat16, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(BFloat16, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
         tmem_full_mbar = smem.allocate_array(Int64, 2)

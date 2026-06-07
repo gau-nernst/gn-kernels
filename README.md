@@ -22,8 +22,9 @@ Available kernels
   - (NVRTC) Matmul with various input dtypes and FP16 accumulation
   - Attention: optional QK with INT8/FP8 MMA
 - CuteDSL:
-  - SM80/SM89 matmul: BF16, INT8, FP8
-  - SM100 matmul: BF16, MXFP8, NVFP4
+  - SM80/SM89 matmul (`cp.async` + `mma.sync`): BF16, INT8, FP8
+  - SM100 matmul (TMA + `tcgen05`): BF16, MXFP8, NVFP4
+  - SM120 matmul (TMA + `mma.sync`): BF16, INT8, FP8
 
 ## Speed benchmarks
 

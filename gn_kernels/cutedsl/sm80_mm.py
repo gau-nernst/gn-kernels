@@ -15,9 +15,8 @@ from .utils import TORCH_TO_CUTE_DTYPE, mma_sync
 class Sm80Matmul:
     """Supports BF16, INT8, FP8"""
 
-    def __init__(self):
-        self.warp_layout = (2, 2)
-        self.num_stages = 2
+    warp_layout = (2, 2)
+    num_stages = 2
 
     @cute.jit
     def make_AB_slayout(self, dtype, BM: int, BK: int, num_stages: int):
@@ -142,7 +141,7 @@ class Sm80Matmul:
             cute.arch.cp_async_wait_group(num_stages - 1)
             cute.arch.sync_threads()
 
-            MMA_K = 256 // dtype.width  # 32B
+            MMA_K = 32 // (dtype.width // 8)  # 32B
             for k in cutlass.range_constexpr(BK // MMA_K):
                 cute.copy(ldsm_atom, sA_ldsm[None, None, k, compute_stage], rA[None, None, k])
                 cute.copy(ldsm_atom, sB_ldsm[None, None, k, compute_stage], rB[None, None, k])
