@@ -99,7 +99,7 @@ def triton_mm_kernel(
     for k in range(K, 0, -BLOCK_K):
         a = tl.load(A, mask=rk[None, :] < k, other=0.0)
         b = tl.load(B, mask=rk[:, None] < k, other=0.0)
-        acc += tl.dot(a, b, out_dtype=ACC_DTYPE)
+        acc = tl.dot(a, b, acc, out_dtype=ACC_DTYPE)
         A += BLOCK_K * stride_A[1]
         B += BLOCK_K * stride_B[0]
 

@@ -33,7 +33,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
-    torch.manual_seed(2025 * 2024 + 2023)
+    torch.manual_seed(2025 * 2024 + 2027)
     COMPUTE_CAPABILITY = torch.cuda.get_device_capability()
 
     # we need to do this to force inductor to use triton's implementation of torch._scaled_mm() on devices with num_sms<68
@@ -54,6 +54,8 @@ if __name__ == "__main__":
         B_f16 = torch.randn(N, K, dtype=torch.float16).T
         A_i8 = torch.randint(-128, 127, size=(M, K), dtype=torch.int8)
         B_i8 = torch.randint(-128, 127, size=(N, K), dtype=torch.int8).T
+        A_f8 = torch.randn(M, K).to(torch.float8_e4m3fn)
+        B_f8 = torch.randn(N, K).to(torch.float8_e4m3fn).T
 
         scale_A = torch.randn(M, 1).div(128)
         scale_B = torch.randn(N, 1).div(128).T
@@ -82,11 +84,11 @@ if __name__ == "__main__":
 
         # FP8
         if COMPUTE_CAPABILITY >= (8, 9):
-            A_f8 = torch.randn(M, K).to(torch.float8_e4m3fn)
-            B_f8 = torch.randn(N, K).to(torch.float8_e4m3fn).T
-
             f8_mm_output = (A_f8.float() @ B_f8.float()).bfloat16()
             f8_triton_tflops = bench_tflops(triton_mm, f8_mm_output, A_f8, B_f8, out_dtype=torch.bfloat16)
+            scaled_f8_pt_tflops = bench_tflops(
+                torch._scaled_mm, None, A_f8, B_f8, scale_A, scale_B, out_dtype=torch.bfloat16
+            )
             scaled_f8_inductor_tflops = bench_tflops(scaled_mm_inductor, scaled_mm_ref, A_f8, B_f8, scale_A, scale_B)
             scaled_f8_triton_tflops = bench_tflops(
                 triton_mm, scaled_mm_ref, A_f8, B_f8, scale_A=scale_A, scale_B=scale_B
@@ -94,18 +96,40 @@ if __name__ == "__main__":
 
         else:
             f8_triton_tflops = 0
+            scaled_f8_pt_tflops = 0
             scaled_f8_inductor_tflops = 0
+            scaled_f8_triton_tflops = 0
+
+        if COMPUTE_CAPABILITY >= (10, 0):
+            # MXFP8
+            scale_A = torch.randn(M, K // 32).to(torch.float8_e8m0fnu)
+            scale_B = torch.randn(N, K // 32).to(torch.float8_e8m0fnu)
+            mxfp8_tflops = bench_tflops(torch._scaled_mm, None, A_f8, B_f8, scale_A, scale_B, out_dtype=torch.bfloat16)
+
+            # NVFP4
+            A = torch.randint(255, size=(M, K // 2), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+            B = torch.randint(255, size=(N, K // 2), dtype=torch.uint8).view(torch.float4_e2m1fn_x2).T
+            scale_A = torch.randn(M, K // 16).to(torch.float8_e4m3fn)
+            scale_B = torch.randn(N, K // 16).to(torch.float8_e4m3fn)
+            nvfp4_tflops = bench_tflops(torch._scaled_mm, None, A, B, scale_A, scale_B, out_dtype=torch.bfloat16)
+
+        else:
+            mxfp8_tflops = 0
+            nvfp4_tflops = 0
 
         data_point = {
             "PyTorch (CuBLAS) BF16": bf16_tflops,
             "Triton FP16 w/ FP16 accumulate": f16_acc_f16_triton_tflops,
             "Triton FP8": f8_triton_tflops,
-            "PyTorch (CuBLAS) INT8": i8_pt_tflops,
-            "Triton INT8": i8_triton_tflops,
+            "PyTorch (Cutlass) row-scaled FP8": scaled_f8_pt_tflops,
             "Inductor (Triton) row-scaled FP8": scaled_f8_inductor_tflops,
             "Triton row-scaled FP8": scaled_f8_triton_tflops,
+            "PyTorch (CuBLAS) INT8": i8_pt_tflops,
+            "Triton INT8": i8_triton_tflops,
             "Inductor (Triton) row-scaled INT8": scaled_i8_inductor_tflops,
             "Triton row-scaled INT8": scaled_i8_triton_tflops,
+            "PyTorch (CuBLAS) MXFP8": mxfp8_tflops,
+            "PyTorch (CuBLAS) NVFP4": nvfp4_tflops,
         }
         data.append(data_point)
 
@@ -116,18 +140,22 @@ if __name__ == "__main__":
         fp16_acc_fp16_tflops = bf16_tflops * 2
         f8_tflops = bf16_tflops * 2
         i8_tflops = bf16_tflops * 4
-        f4_tflops = bf16_tflops * 8
-        dims.append("Theoretical")
+        mxfp8_tflops = bf16_tflops * 4  # mxfp8 is not nerfed
+        nvfp4_tflops = bf16_tflops * 8
+        dims.append("SOL")
         data_point = {
             "PyTorch (CuBLAS) BF16": bf16_tflops,
             "Triton FP16 w/ FP16 accumulate": fp16_acc_fp16_tflops,
             "Triton FP8": f8_tflops,
-            "PyTorch (CuBLAS) INT8": i8_tflops,
-            "Triton INT8": i8_tflops,
+            "PyTorch (Cutlass) row-scaled FP8": f8_tflops,
             "Inductor (Triton) row-scaled FP8": f8_tflops,
             "Triton row-scaled FP8": f8_tflops,
+            "PyTorch (CuBLAS) INT8": i8_tflops,
+            "Triton INT8": i8_tflops,
             "Inductor (Triton) row-scaled INT8": i8_tflops,
             "Triton row-scaled INT8": i8_tflops,
+            "PyTorch (CuBLAS) MXFP8": mxfp8_tflops,
+            "PyTorch (CuBLAS) NVFP4": nvfp4_tflops,
         }
         data.append(data_point)
 

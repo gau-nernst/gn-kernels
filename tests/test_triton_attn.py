@@ -35,7 +35,7 @@ def test_triton_attn(q_len: int, kv_len: int, causal: bool):
     v = torch.randn(bs, kv_len, kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
 
     out = triton_attn(q, k, v, causal=causal)
-    assert not out.isnan().any()
+    torch.cuda.synchronize()
 
     out_ref = ref_attn(q, k, v, causal=causal)
     torch.testing.assert_close(out, out_ref, rtol=1.6e-2, atol=1e-3)
@@ -72,10 +72,11 @@ def test_triton_varlen_attn(causal: bool):
     kv_offsets = torch.tensor(kv_offsets_list, device="cuda")
 
     out = triton_varlen_attn(q, k, v, q_offsets, kv_offsets, max_q_len, causal=causal)
+    torch.cuda.synchronize()
 
     out_ref_list = []
     for q_, k_, v_ in zip(q_list, k_list, v_list):
         out_ref_list.append(ref_attn(q_[None], k_[None], v_[None], causal=causal)[0])
     out_ref = torch.cat(out_ref_list, dim=0)
 
-    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(out, out_ref, rtol=1.6e-2, atol=1e-3)

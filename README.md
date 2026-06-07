@@ -45,21 +45,23 @@ Note: INT8 matmul implementation I'm using on MI300x is probably not good.
 ### Matmul
 
 RTX 5090 TFLOPS @ 400W. See [`benchmark_mm.py`](benchmark_mm.py) (might need better configs for FP16)
-- `torch==2.8.0`
-- `pytorch-triton==3.4.0+git11ec6354`
+- `torch==2.12.0`
+- `triton==3.7.0`
 
 Note:
-- Bad FP8 perf on Triton is fixed in https://github.com/triton-lang/triton/pull/7409
 - Row-major x Column-major
 
-|                                   |   1024 |   2048 |    4096 |   Theoretical |
-|:----------------------------------|-------:|-------:|--------:|--------------:|
-| PyTorch (CuBLAS) BF16             |  87.38 | 167.77 |  176.99 |         209.5 |
-| Triton FP16 w/ FP16 accumulate    | 149.8  | 288.95 |  273.77 |         419   |
-| Triton FP8                        | 116.71 | 190.58 |  217.19 |         419   |
-| PyTorch (CuBLAS) INT8             | 209.72 | 466.03 |  593.8  |         838   |
-| Triton INT8                       | 173.41 | 466.03 |  524.29 |         838   |
-| Inductor (Triton) row-scaled FP8  | 116.51 | 189.77 |  214.27 |         419   |
-| Triton row-scaled FP8             | 116.11 | 190.45 |  216.83 |         419   |
-| Inductor (Triton) row-scaled INT8 | 149.46 | 400.35 |  520.22 |         838   |
-| Triton row-scaled INT8            | 173.41 | 493.45 |  541.41 |         838   |
+|                                   |   1024 |   2048 |    4096 |    SOL |
+|:----------------------------------|-------:|-------:|--------:|-------:|
+| PyTorch (CuBLAS) BF16             | 130.82 | 167.77 |  203.05 |  209.5 |
+| Triton FP16 w/ FP16 accumulate    | 149.46 | 279.47 |  267.37 |  419   |
+| Triton FP8                        | 173.86 | 320.33 |  379.08 |  419   |
+| PyTorch (Cutlass) row-scaled FP8  | 174.76 | 310.69 |  390.17 |  419   |
+| Inductor (Triton) row-scaled FP8  | 178.96 | 309.08 |  392.09 |  419   |
+| Triton row-scaled FP8             | 170.33 | 310.69 |  376.78 |  419   |
+| PyTorch (CuBLAS) INT8             | 209.72 | 466.03 |  583.56 |  838   |
+| Triton INT8                       | 175.22 | 470.53 |  530.47 |  838   |
+| Inductor (Triton) row-scaled INT8 | 147.17 | 419.43 |  520.22 |  838   |
+| Triton row-scaled INT8            | 174.76 | 493.45 |  542.57 |  838   |
+| PyTorch (CuBLAS) MXFP8            | 171.2  | 462.82 |  531.52 |  838   |
+| PyTorch (CuBLAS) NVFP4            | 215.09 | 762.6  | 1139.85 | 1676   |

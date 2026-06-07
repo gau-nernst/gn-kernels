@@ -1,4 +1,5 @@
 # https://github.com/triton-lang/triton/blob/v3.3.1/python/tutorials/06-fused-attention.py
+# NOTE: we are getting OOB sometimes when Q_LEN and/or KV_LEN are not divisible by BLOCK_M/BLOCK_N
 
 import triton
 import triton.language as tl
