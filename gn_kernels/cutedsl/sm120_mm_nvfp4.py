@@ -9,7 +9,7 @@ from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_tensor
 
-from .utils import mma_sync_nvfp4, simple_tma_g2s
+from .utils import mma_sync_nvfp4, permute, simple_tma_g2s
 
 
 class Sm120MatmulNVFP4:
@@ -235,21 +235,19 @@ class Sm120MatmulNVFP4:
             gC_cta = cute.local_tile(gC, tiler=(BM, BN), coord=(bid_m, bid_n))
             gC_warp = cute.local_tile(gC_cta, tiler=(WM, WN), coord=(warp_id_m, warp_id_n))
 
-            # (2, (WM, WN/2))
-            gC_warp = cute.zipped_divide(gC_warp, (1, 2))[(0, None), None]
+            # (((8,2),(2,4)), (WM/16,WN/8))
+            gC_view = cute.zipped_divide(gC_warp, (cute.make_layout((8, 2)), cute.make_layout((2, 4))))
 
-            # (2, (((8,2), WM/16), (4,WN/8)))
-            gC_view = cute.logical_divide(gC_warp, (None, (cute.make_layout((8, 2)), 4)))
-
-            # (2, 2, WM/16, WN/8)
-            gC_thr = gC_view[None, (((lane_id // 4, None), None), (lane_id % 4, None))]
+            # (2, 2, (WM/16,WN/8))
+            gC_view = gC_view[((lane_id // 4, None), (None, lane_id % 4)), None]
+            gC_view = permute(gC_view, (1, 0, 2))
 
             # explicit for loop to interleave cvt with st.global
             for m in cutlass.range_constexpr(WM // 16):
                 for n in cutlass.range_constexpr(WN // 8):
                     rC_bf16 = cute.make_rmem_tensor((2, 2), BFloat16)
                     rC_bf16.store(rC[None, n, m].load().to(BFloat16))
-                    cute.copy(cp_atom, rC_bf16, gC_thr[None, None, m, n])
+                    cute.copy(cp_atom, rC_bf16, gC_view[None, None, (m, n)])
 
     @cache
     @staticmethod
