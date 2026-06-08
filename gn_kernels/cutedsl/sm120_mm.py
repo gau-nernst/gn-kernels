@@ -21,9 +21,14 @@ class Sm120Matmul:
     @cute.jit
     def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
         tma_op = cpasync.CopyBulkTensorTileG2SOp()
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
+
+        # compute swizzle param
+        width = BK * (A.dtype.width // 8)
+        B = int(math.log2(width)) - 4
+        assert B <= 3  # 128B
+        swizzle = cute.make_swizzle(B, 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
-        s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
+        s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
 
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
         return tma_atom, tma_tensor, s_layout
@@ -31,7 +36,7 @@ class Sm120Matmul:
     @cute.jit
     def __call__(self, gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, stream: CUstream):
         BM, BN = 128, 128
-        BK = 128 // (gA.element_type.width // 8)  # 128B
+        BK = 64 // (gA.element_type.width // 8)  # 64B
         cta_tile = (BM, BN, BK)
 
         A_args = self.prepare_AB(gA, BM, BK)
