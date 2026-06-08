@@ -9,7 +9,7 @@ from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_tensor
 
-from .utils import mma_sync_nvfp4, permute, simple_tma_g2s
+from .utils import mma_sync_nvfp4, permute, simple_tma_g2s, tma_g2s
 
 
 class Sm120MatmulNVFP4:
@@ -109,10 +109,6 @@ class Sm120MatmulNVFP4:
             tma_stage = 0
             parity = 1
 
-            # for SF TMA
-            op = cpasync.CopyBulkG2SOp()
-            sf_tma_atom = cute.make_copy_atom(op, Float8E4M3FN, num_bits_per_copy=2048 * 8)
-
             # select gmem tile
             gA_tiles = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
             gB_tiles = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))
@@ -130,10 +126,10 @@ class Sm120MatmulNVFP4:
                 simple_tma_g2s(A_tma_atom, gA_tiles[None, None, iter_k], sA[None, None, tma_stage], mbar)
                 simple_tma_g2s(B_tma_atom, gB_tiles[None, None, iter_k], sB[None, None, tma_stage], mbar)
 
-                # CuteDSL doesn't put cp.async.bulk under elect.sync
-                with cute.arch.elect_one():
-                    cute.copy(sf_tma_atom, gSFA_tiles[None, iter_k], sSFA[None, tma_stage], mbar_ptr=mbar)
-                    cute.copy(sf_tma_atom, gSFB_tiles[None, iter_k], sSFB[None, tma_stage], mbar_ptr=mbar)
+                # cpasync.CopyBulkG2SOp() generates mapa + cp.async.bulk.shared::cluster.global,
+                # which is unnecessary.
+                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, iter_k], Int32(2048), mbar)
+                tma_g2s(sSFB[None, tma_stage], gSFB_tiles[None, iter_k], Int32(2048), mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:

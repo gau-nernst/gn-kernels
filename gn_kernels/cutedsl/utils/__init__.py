@@ -2,7 +2,7 @@ import cutlass
 import torch
 from cutlass import Int16, Int32, cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, vector
+from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -196,3 +196,24 @@ def mma_sync_nvfp4(
         ip=ip,
     )
     return cute.TensorSSA(vec, 4, c.element_type)
+
+
+@dsl_user_op
+def tma_g2s(dst: cute.Tensor, src: cute.Tensor, size: Int32, mbar: cute.Pointer, *, loc=None, ip=None):
+    # CuteDSL doesn't expose global->shared::cta in nvvm
+    with cute.arch.elect_one():
+        llvm.inline_asm(
+            llvm.StructType.get_literal([Int32.mlir_type]),
+            [
+                dst.iterator.toint().ir_value(loc=loc, ip=ip),
+                src.iterator.toint().ir_value(loc=loc, ip=ip),
+                size.ir_value(loc=loc, ip=ip),
+                mbar.toint().ir_value(loc=loc, ip=ip),
+            ],
+            "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$1], [$2], $3, [$4];",
+            "=r,r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            loc=loc,
+            ip=ip,
+        )
