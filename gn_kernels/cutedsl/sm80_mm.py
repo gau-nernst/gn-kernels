@@ -84,6 +84,12 @@ class Sm80Matmul:
         sA = smem.allocate_tensor(dtype, sA_layout, 16)
         sB = smem.allocate_tensor(dtype, sB_layout, 16)
 
+        # pre-compute cp.async address
+        gA_g2s, sA_g2s = self.prepare_g2s(gA_tiles, sA, tid)
+        gB_g2s, sB_g2s = self.prepare_g2s(gB_tiles, sB, tid)
+        cpasync_op = cpasync.CopyG2SOp(nvgpu.LoadCacheMode.GLOBAL)
+        cpasync_atom = cute.make_copy_atom(cpasync_op, dtype, num_bits_per_copy=128)
+
         # warp partition
         # shape: (WM, BK, num_stages)
         # (well, the 2nd mode, is actually (width,BK/width). but to simplify the expresion...)
@@ -116,8 +122,8 @@ class Sm80Matmul:
 
         # prefetch
         for i in cutlass.range_constexpr(num_stages - 1):
-            self.load_g2s(gA_tiles[None, None, i], sA[None, None, i], tid)
-            self.load_g2s(gB_tiles[None, None, i], sB[None, None, i], tid)
+            cute.copy(cpasync_atom, gA_g2s[None, None, i], sA_g2s[None, None, i])
+            cute.copy(cpasync_atom, gB_g2s[None, None, i], sB_g2s[None, None, i])
             cute.arch.cp_async_commit_group()
 
         load_stage = num_stages - 1
@@ -129,8 +135,8 @@ class Sm80Matmul:
             load_k = iter_k + (num_stages - 1)
             if load_k < num_iters:
                 cute.arch.sync_threads()
-                self.load_g2s(gA_tiles[None, None, load_k], sA[None, None, load_stage], tid)
-                self.load_g2s(gB_tiles[None, None, load_k], sB[None, None, load_stage], tid)
+                cute.copy(cpasync_atom, gA_g2s[None, None, load_k], sA_g2s[None, None, load_stage])
+                cute.copy(cpasync_atom, gB_g2s[None, None, load_k], sB_g2s[None, None, load_stage])
                 load_stage = (load_stage + 1) % num_stages
             cute.arch.cp_async_commit_group()
 
@@ -171,12 +177,9 @@ class Sm80Matmul:
                 cute.copy(cp_atom, rC_bf16, gC_view[None, None, (m, n)])
 
     @cute.jit
-    def load_g2s(self, gA: cute.Tensor, sA: cute.Tensor, tid: Int32):
+    def prepare_g2s(self, gA: cute.Tensor, sA: cute.Tensor, tid: Int32):
         # cp.async.cg
         dtype = gA.element_type
-        op = cpasync.CopyG2SOp(nvgpu.LoadCacheMode.GLOBAL)
-        atom = cute.make_copy_atom(op, dtype, num_bits_per_copy=128)
-
         tb_size = math.prod(self.warp_layout) * 32
         BK = cute.size(sA, 1)
 
@@ -184,14 +187,15 @@ class Sm80Matmul:
         num_cols = BK // elems
         num_rows = tb_size // num_cols
 
-        # (num_rows, 8, BM/num_rows)
-        gA_view = cute.local_tile(gA, (num_rows, elems), (None, tid % num_cols))
-        sA_view = cute.local_tile(sA, (num_rows, elems), (None, tid % num_cols))
+        # ((num_rows, 8), (BM/num_rows, BK/elems, K/BK))
+        gA_view = cute.zipped_divide(gA, (num_rows, elems))
+        sA_view = cute.zipped_divide(sA, (num_rows, elems))
 
-        # (8, BM/num_rows)
-        gA_view = gA_view[tid // num_cols, None, None]
-        sA_view = sA_view[tid // num_cols, None, None]
-        cute.copy(atom, gA_view, sA_view)
+        # (8, BM/num_rows, K/BK)
+        gA_view = gA_view[(tid // num_cols, None), (None, tid % num_cols, None)]
+        sA_view = sA_view[(tid // num_cols, None), (None, tid % num_cols, None)]
+
+        return gA_view, sA_view
 
     @cache
     @staticmethod
