@@ -29,9 +29,7 @@ class Sm120Matmul:
         swizzle = cute.make_swizzle(B, 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
         s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
-
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
-        return tma_atom, tma_tensor, s_layout
+        return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
 
     @cute.jit
     def __call__(self, gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, stream: CUstream):
@@ -39,20 +37,20 @@ class Sm120Matmul:
         BK = 64 // (gA.element_type.width // 8)  # 64B
         cta_tile = (BM, BN, BK)
 
-        A_args = self.prepare_AB(gA, BM, BK)
-        B_args = self.prepare_AB(gB, BN, BK)
+        A_tma = self.prepare_AB(gA, BM, BK)
+        B_tma = self.prepare_AB(gB, BN, BK)
 
         M, N = gC.shape
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
-        self.kernel(A_args, B_args, gC, cta_tile).launch(grid=grid, block=block, stream=stream)
+        self.kernel(A_tma, B_tma, gC, cta_tile).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def kernel(
         self,
-        A_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
-        B_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
+        A_tma: cpasync.TmaInfo,
+        B_tma: cpasync.TmaInfo,
         gC: cute.Tensor,
         cta_tile: cutlass.Constexpr[tuple[int, int, int]],
     ):
@@ -65,11 +63,10 @@ class Sm120Matmul:
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
 
-        A_tma_atom, A_tma_tensor, sA_layout = A_args
-        B_tma_atom, B_tma_tensor, sB_layout = B_args
-
-        _, K = A_tma_tensor.shape
-        dtype = A_tma_atom.value_type
+        _, K = A_tma.tma_tensorr.shape
+        dtype = A_tma.atom.value_type
+        sA_layout = A_tma.smem_layout
+        sB_layout = B_tma.smem_layout
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
@@ -86,8 +83,8 @@ class Sm120Matmul:
                     cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
                 cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
-            cpasync.prefetch_descriptor(A_tma_atom)
-            cpasync.prefetch_descriptor(B_tma_atom)
+            cpasync.prefetch_descriptor(A_tma.atom)
+            cpasync.prefetch_descriptor(B_tma.atom)
         cute.arch.sync_threads()
 
         if warp_id == 4:
@@ -96,8 +93,8 @@ class Sm120Matmul:
             parity = 1
 
             # select gmem tile
-            gA_tiles = cute.local_tile(A_tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
-            gB_tiles = cute.local_tile(B_tma_tensor, (BN, BK), (bid_n, None))
+            gA_tiles = cute.local_tile(A_tma.tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
+            gB_tiles = cute.local_tile(B_tma.tma_tensor, (BN, BK), (bid_n, None))
 
             for iter_k in range(K // BK):
                 mbar = tma_full_mbar + tma_stage
@@ -107,8 +104,8 @@ class Sm120Matmul:
                 with cute.arch.elect_one():
                     STAGE_SIZE = (BM + BN) * BK * (dtype.width // 8)
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
-                simple_tma_g2s(A_tma_atom, gA_tiles[None, None, iter_k], sA[None, None, tma_stage], mbar)
-                simple_tma_g2s(B_tma_atom, gB_tiles[None, None, iter_k], sB[None, None, tma_stage], mbar)
+                simple_tma_g2s(A_tma.atom, gA_tiles[None, None, iter_k], sA[None, None, tma_stage], mbar)
+                simple_tma_g2s(B_tma.atom, gB_tiles[None, None, iter_k], sB[None, None, tma_stage], mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:

@@ -30,16 +30,14 @@ class Sm100MatmulBF16:
         swizzle_128B = cute.make_swizzle(3, 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
         s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
-
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
-        return tma_atom, tma_tensor, s_layout
+        return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
 
     @cute.jit
     def __call__(self, A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, stream: CUstream):
         BM, BN, BK = self.cta_tile
-        A_args = self.prepare_AB(A, BM, BK)
-        B_args = self.prepare_AB(B, BN // self.cta_group, BK)
-        self.kernel(A_args, B_args, C).launch(
+        A_tma = self.prepare_AB(A, BM, BK)
+        B_tma = self.prepare_AB(B, BN // self.cta_group, BK)
+        self.kernel(A_tma, B_tma, C).launch(
             grid=(128, 1, 1),
             block=(6 * 32, 1, 1),
             cluster=(self.cta_group, 1, 1),
@@ -47,12 +45,7 @@ class Sm100MatmulBF16:
         )
 
     @cute.kernel
-    def kernel(
-        self,
-        A_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
-        B_args: tuple[cute.CopyAtom, cute.Tensor, cute.ComposedLayout],
-        C_tensor: cute.Tensor,
-    ):
+    def kernel(self, A_tma: cpasync.TmaInfo, B_tma: cpasync.TmaInfo, C_tensor: cute.Tensor):
         tid, _, _ = cute.arch.thread_idx()
         raw_bid, _, _ = cute.arch.block_idx()
         num_bids, _, _ = cute.arch.grid_dim()
@@ -65,8 +58,8 @@ class Sm100MatmulBF16:
         is_2cta = cta_group == 2
         cta_rank = raw_bid % cta_group
 
-        A_tma_atom, A_tma_tensor, sA_layout = A_args
-        B_tma_atom, B_tma_tensor, sB_layout = B_args
+        sA_layout = A_tma.smem_layout
+        sB_layout = B_tma.smem_layout
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
@@ -79,8 +72,8 @@ class Sm100MatmulBF16:
         tmem_empty_mbar = smem.allocate_array(Int64, 2)
         taddr = smem.allocate(Int32, 4)
 
-        M, K = A_tma_tensor.shape
-        N, _ = B_tma_tensor.shape
+        M, K = A_tma.tma_tensor.shape
+        N, _ = B_tma.tma_tensor.shape
         grid_m = cute.ceil_div(M, BM)
         grid_n = cute.ceil_div(N, BN)
 
@@ -94,8 +87,8 @@ class Sm100MatmulBF16:
                     cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * cta_group)
                 cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
-            cpasync.prefetch_descriptor(A_tma_atom)
-            cpasync.prefetch_descriptor(B_tma_atom)
+            cpasync.prefetch_descriptor(A_tma.atom)
+            cpasync.prefetch_descriptor(B_tma.atom)
 
         if cutlass.const_expr(is_2cta):
             cute.arch.cluster_arrive_relaxed()
@@ -114,8 +107,8 @@ class Sm100MatmulBF16:
                 tma_full_mbar_ = tma_full_mbar
 
             # select gmem tile
-            gA_tiles = cute.zipped_divide(A_tma_tensor, (BM, BK))  # [(BM, BK), (M/BM, K/BK)]
-            gB_tiles = cute.zipped_divide(B_tma_tensor, (BN // cta_group, BK))
+            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (BM, BK))  # [(BM, BK), (M/BM, K/BK)]
+            gB_tiles = cute.zipped_divide(B_tma.tma_tensor, (BN // cta_group, BK))
 
             for bid in range(raw_bid, grid_m * grid_n, num_bids):
                 bid_m = bid // (grid_n * 2) * 2 + bid % 2
@@ -129,8 +122,8 @@ class Sm100MatmulBF16:
 
                     with cute.arch.elect_one():
                         mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
-                    simple_tma_g2s(A_tma_atom, gA_tiles[None, (bid_m, iter_k)], sA[None, None, tma_stage], mbar)
-                    simple_tma_g2s(B_tma_atom, gB_tiles[None, (bid_n_, iter_k)], sB[None, None, tma_stage], mbar)
+                    simple_tma_g2s(A_tma.atom, gA_tiles[None, (bid_m, iter_k)], sA[None, None, tma_stage], mbar)
+                    simple_tma_g2s(B_tma.atom, gB_tiles[None, (bid_n_, iter_k)], sB[None, None, tma_stage], mbar)
 
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:

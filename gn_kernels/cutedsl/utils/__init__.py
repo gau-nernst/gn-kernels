@@ -2,7 +2,7 @@ import cutlass
 import torch
 from cutlass import Int16, Int32, cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 
