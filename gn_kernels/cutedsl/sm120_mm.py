@@ -63,7 +63,7 @@ class Sm120Matmul:
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
 
-        _, K = A_tma.tma_tensorr.shape
+        _, K = A_tma.tma_tensor.shape
         dtype = A_tma.atom.value_type
         sA_layout = A_tma.smem_layout
         sB_layout = B_tma.smem_layout
