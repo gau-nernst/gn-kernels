@@ -5,7 +5,7 @@ import torch
 from .attn import attn_int8, attn_int8_qk, attn_mxfp8_qk
 from .triton_attn import triton_attn
 from .triton_mm import triton_mm
-from .utils import FP4_DTYPE, dequantize_mx, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
+from .utils import dequantize_mx, pack_block_scales_nv, quantize_mx, quantize_nvfp4, quantize_nvfp4_triton
 
 __all__ = [
     "triton_mm",
@@ -19,7 +19,6 @@ __all__ = [
     "quantize_nvfp4_triton",
     "dequantize_mx",
     "pack_block_scales_nv",
-    "FP4_DTYPE",
 ]
 
 CURRENT_DIR = Path(__file__).parent
