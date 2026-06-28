@@ -5,17 +5,14 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-# drop this workaround once PyTorch 2.8 is released
-FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
-
 DTYPE_AMAX_LUT = {
-    FP4_DTYPE: 6.0,
+    torch.float4_e2m1fn_x2: 6.0,
     torch.float8_e4m3fn: 448.0,
     torch.float8_e5m2: 57_344.0,
 }
 
 DTYPE_POW2_AMAX_LUT = {
-    FP4_DTYPE: 4.0,
+    torch.float4_e2m1fn_x2: 4.0,
     torch.float8_e4m3fn: 256.0,
     torch.float8_e5m2: 32_768.0,
 }
@@ -81,11 +78,11 @@ def fp32_to_fp4e2m1x2(x: Tensor):
         | (f4_e2m1[..., 6::8] << 24)
         | (f4_e2m1[..., 7::8] << 28)
     )
-    return f4_e2m1x2.view(FP4_DTYPE)
+    return f4_e2m1x2.view(torch.float4_e2m1fn_x2)
 
 
 def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"):
-    assert dtype in (torch.float8_e4m3fn, torch.float8_e5m2, FP4_DTYPE)
+    assert dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float4_e2m1fn_x2)
     x_blocks_f32 = x.float().unflatten(-1, (-1, 32))  # [..., N/32, 32]
     blocks_amax = x_blocks_f32.abs().amax(dim=-1)  # [..., N/32]
 
@@ -102,7 +99,7 @@ def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"
     x_blocks_f32 = x_blocks_f32 / (block_scales_bits.unsqueeze(-1) << 23).view(torch.float32).clip(1e-12)
     x_blocks_f32 = x_blocks_f32.clip(-dtype_amax, dtype_amax)
 
-    if dtype == FP4_DTYPE:
+    if dtype == torch.float4_e2m1fn_x2:
         xq = fp32_to_fp4e2m1x2(x_blocks_f32)
     else:
         xq = x_blocks_f32.to(dtype)
@@ -117,7 +114,7 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
     if xq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return (xq.float().reshape(-1, 32) * scales.float().reshape(-1, 1)).view(xq.shape)
 
-    elif xq.dtype == FP4_DTYPE:
+    elif xq.dtype == torch.float4_e2m1fn_x2:
         FP4E2M1_LUT = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
             device=xq.device,
@@ -150,7 +147,7 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
 def quantize_nvfp4(x: Tensor, tensor_scale: Tensor | None = None):
     x_blocks_f32 = x.float().unflatten(-1, (-1, 16))  # [..., N/16, 16]
 
-    q_dtype = FP4_DTYPE
+    q_dtype = torch.float4_e2m1fn_x2
     s_dtype = torch.float8_e4m3fn
     q_dtype_amax = DTYPE_AMAX_LUT[q_dtype]
     s_dtype_amax = DTYPE_AMAX_LUT[s_dtype]
@@ -229,7 +226,7 @@ def quantize_nvfp4_triton(x: Tensor, tensor_scale: Tensor):
     grid = (N // 64, M // 128)
     quantize_nvfp4_triton_kernel[grid](x, tensor_scale, xq, scales, x.stride(0), x.stride(1), N)
 
-    return xq.view(FP4_DTYPE), scales
+    return xq.view(torch.float4_e2m1fn_x2), scales
 
 
 def do_bench(f, num: int, num_warmup: int = 10):
