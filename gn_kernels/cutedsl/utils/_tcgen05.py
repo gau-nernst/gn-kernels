@@ -6,8 +6,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 CTA_GROUP_MAP = [
     None,
-    nvvm.Tcgen05GroupKind.CTA_1,
-    nvvm.Tcgen05GroupKind.CTA_2,
+    nvvm.CTAGroupKind.CTA_1,
+    nvvm.CTAGroupKind.CTA_2,
 ]
 
 LDST_MAP = {
@@ -159,9 +159,9 @@ def commit(mbar, cta_mask=None, cta_group: int = 1, *, loc=None, ip=None) -> Non
     with cute.arch.elect_one():
         if cutlass.const_expr(cta_mask is not None):
             mask = cta_mask.ir_value(loc=loc, ip=ip)
-            nvvm.tcgen05_commit_arrive(mbar_llvm, multicast_mask=mask, group=group, loc=loc, ip=ip)
+            nvvm.tcgen05_commit(mbar_llvm, multicast_mask=mask, group=group, loc=loc, ip=ip)
         else:
-            nvvm.tcgen05_commit_arrive(mbar_llvm, group=group, loc=loc, ip=ip)
+            nvvm.tcgen05_commit(mbar_llvm, group=group, loc=loc, ip=ip)
 
 
 @dsl_user_op
