@@ -40,6 +40,7 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
+        global_scale: Float32,
         stream: CUstream,
     ):
         M, K = gA.shape
@@ -54,7 +55,10 @@ class Sm120MatmulNVFP4:
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
-        self.kernel(A_tma, B_tma, gSFA, gSFB, gC).launch(grid=grid, block=block, stream=stream)
+        if global_scale == 1.0:
+            self.kernel(A_tma, B_tma, gSFA, gSFB, gC, global_scale, False).launch(grid=grid, block=block, stream=stream)
+        else:
+            self.kernel(A_tma, B_tma, gSFA, gSFB, gC, global_scale, True).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def kernel(
@@ -64,6 +68,8 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
+        global_scale: Float32,
+        HAS_SCALE: cutlass.Constexpr[cutlass.Boolean],
     ):
         tid, _, _ = cute.arch.thread_idx()
         bid_m, bid_n, _ = cute.arch.block_idx()
@@ -238,8 +244,15 @@ class Sm120MatmulNVFP4:
             # explicit for loop to interleave cvt with st.global
             for m in cutlass.range_constexpr(WM // 16):
                 for n in cutlass.range_constexpr(WN // 8):
+                    rC_f32 = cute.make_rmem_tensor((2, 2), Float32)
+                    for i in cutlass.range(4, vectorize=True):
+                        if cutlass.const_expr(HAS_SCALE):
+                            rC_f32[i] = rC[i, n, m] * global_scale
+                        else:
+                            rC_f32[i] = rC[i, n, m]
+
                     rC_bf16 = cute.make_rmem_tensor((2, 2), BFloat16)
-                    rC_bf16.store(rC[None, n, m].load().to(BFloat16))
+                    rC_bf16.store(rC_f32.load().to(BFloat16))
                     cute.copy(cp_atom, rC_bf16, gC_view[None, None, (m, n)])
 
     @cache
@@ -257,10 +270,10 @@ class Sm120MatmulNVFP4:
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm120MatmulNVFP4()
-        return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
+        return cute.compile(kernel, A, B, SFA, SFB, C, Float32(1.0), stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
+def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor, global_scale: float = 1.0):
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C)
+    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C, global_scale)
     return C
