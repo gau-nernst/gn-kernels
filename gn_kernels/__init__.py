@@ -2,7 +2,9 @@ from pathlib import Path
 
 import torch
 
+from . import cutedsl
 from .attn import attn_int8, attn_int8_qk, attn_mxfp8_qk
+from .cublas_nvfp4 import cublas_nvfp4_mm
 from .quant_utils import (
     dequantize_mx,
     permute_nv_sf,
@@ -28,6 +30,7 @@ __all__ = [
     "dequantize_mx",
     "permute_nv_sf",
     "unpermute_nv_sf",
+    "cutedsl",
 ]
 
 CURRENT_DIR = Path(__file__).parent

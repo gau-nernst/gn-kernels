@@ -34,6 +34,12 @@ def get_ext_modules():
     return [
         get_extension("80"),
         get_extension("120a"),
+        CUDAExtension(
+            name=f"{NAME}._cublas",
+            sources=["gn_kernels/csrc/_cublas.cpp"],
+            libraries=["cublasLt"],
+            py_limited_api=True,
+        ),
     ]
 
 
