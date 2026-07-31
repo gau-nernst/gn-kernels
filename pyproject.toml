@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gn-kernels"
 version = "0.0.1"
+dependencies = [
+    "nvidia-cutlass-dsl[cu13]==4.6.1",
+    "apache-tvm-ffi",
+]
 
 [tool.setuptools]
 include-package-data = true

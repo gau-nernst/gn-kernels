@@ -40,7 +40,7 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
-        global_scale: Float32,
+        alpha: Float32,
         stream: CUstream,
     ):
         M, K = gA.shape
@@ -55,10 +55,7 @@ class Sm120MatmulNVFP4:
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
-        if global_scale == 1.0:
-            self.kernel(A_tma, B_tma, gSFA, gSFB, gC, global_scale, False).launch(grid=grid, block=block, stream=stream)
-        else:
-            self.kernel(A_tma, B_tma, gSFA, gSFB, gC, global_scale, True).launch(grid=grid, block=block, stream=stream)
+        self.kernel(A_tma, B_tma, gSFA, gSFB, gC, alpha).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def kernel(
@@ -68,8 +65,7 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
-        global_scale: Float32,
-        HAS_SCALE: cutlass.Constexpr[cutlass.Boolean],
+        alpha: Float32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         bid_m, bid_n, _ = cute.arch.block_idx()
@@ -246,10 +242,7 @@ class Sm120MatmulNVFP4:
                 for n in cutlass.range_constexpr(WN // 8):
                     rC_f32 = cute.make_rmem_tensor((2, 2), Float32)
                     for i in cutlass.range(4, vectorize=True):
-                        if cutlass.const_expr(HAS_SCALE):
-                            rC_f32[i] = rC[i, n, m] * global_scale
-                        else:
-                            rC_f32[i] = rC[i, n, m]
+                        rC_f32[i] = rC[i, n, m] * alpha
 
                     rC_bf16 = cute.make_rmem_tensor((2, 2), BFloat16)
                     rC_bf16.store(rC_f32.load().to(BFloat16))
@@ -273,7 +266,7 @@ class Sm120MatmulNVFP4:
         return cute.compile(kernel, A, B, SFA, SFB, C, Float32(1.0), stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor, global_scale: float = 1.0):
+def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor, alpha: float = 1.0):
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C, global_scale)
+    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C, alpha)
     return C

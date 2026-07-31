@@ -1,6 +1,5 @@
-import statistics
-
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -19,12 +18,22 @@ DTYPE_POW2_AMAX_LUT = {
 
 
 # https://github.com/NVIDIA/cutlass/blob/v3.9.2/media/docs/cpp/blackwell_functionality.md#scale-factor-layouts
-def pack_block_scales_nv(scales: Tensor):
+def permute_nv_sf(scales: Tensor):
     M, N = scales.shape
-    assert M % 128 == 0 and N % 4 == 0  # don't support padding for now
-    out = scales.reshape(M // 128, 128, N // 4, 4).transpose(1, 2)  # [num_M_tiles, num_N_tiles, 128, 4]
-    out = out.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-    return out.flatten()
+    # assert M % 128 == 0 and N % 4 == 0, (M, N)  # don't support padding for now
+    if M % 128 != 0 or N % 4 != 0:
+        pad_M = triton.cdiv(M, 128) * 128 - M
+        pad_N = triton.cdiv(N, 4) * 4 - N
+        scales = F.pad(scales.view(torch.uint8), (0, pad_N, 0, pad_M)).view(scales.dtype)
+        M, N = scales.shape
+    out = scales.reshape(M // 128, 4, 32, N // 4, 4).permute(0, 3, 2, 1, 4)
+    return out.reshape(M, N)
+
+
+def unpermute_nv_sf(scales: Tensor):
+    M, N = scales.shape
+    out = scales.view(M // 128, N // 4, 32, 4, 4).permute(0, 3, 2, 1, 4)
+    return out.reshape(M, N)
 
 
 # https://docs.nvidia.com/cuda/cublas/index.html#d-block-quantization
@@ -144,43 +153,51 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
 
 
 # https://docs.nvidia.com/cuda/cublas/index.html#d-block-quantization
-def quantize_nvfp4(x: Tensor, tensor_scale: Tensor | None = None):
+def quantize_nvfp4(x: Tensor, tensor_scale: Tensor | None = None, eps: float = 1e-12):
     x_blocks_f32 = x.float().unflatten(-1, (-1, 16))  # [..., N/16, 16]
-
-    q_dtype = torch.float4_e2m1fn_x2
-    s_dtype = torch.float8_e4m3fn
-    q_dtype_amax = DTYPE_AMAX_LUT[q_dtype]
-    s_dtype_amax = DTYPE_AMAX_LUT[s_dtype]
 
     # tensor_scale can be provided (e.g. for activations)
     # or calculated on-the-fly (e.g. for weights)
     if tensor_scale is None:
-        tensor_scale = x_blocks_f32.abs().amax() / (q_dtype_amax * s_dtype_amax)
+        tensor_scale = x_blocks_f32.abs().amax() / (448.0 * 6.0)
 
     blocks_amax = x_blocks_f32.abs().amax(dim=-1)  # [M, N/16]
-    scales_f32 = blocks_amax / (q_dtype_amax * tensor_scale).clip(1e-12)
-    scales = scales_f32.clip(-s_dtype_amax, s_dtype_amax).to(s_dtype)
+    scales_f32 = blocks_amax / (6.0 * tensor_scale).clip(1e-12)
+    scales = scales_f32.clip(-448.0, 448.0).to(torch.float8_e4m3fn)
 
-    x_blocks_f32 = x_blocks_f32 / (tensor_scale * scales.float()).unsqueeze(-1).clip(1e-12)
+    x_blocks_f32 = x_blocks_f32 / (tensor_scale * scales.float()).unsqueeze(-1).clip(eps)
     xq = fp32_to_fp4e2m1x2(x_blocks_f32).view(x.shape[0], -1)
 
     return xq, scales, tensor_scale
 
 
 @triton.jit
-def quantize_nvfp4_triton_kernel(x_ptr, tensor_scale_ptr, q_ptr, s_ptr, stride_xm, stride_xn, N):
+def quantize_nvfp4_triton_kernel(
+    x_ptr,
+    tensor_scale_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    eps: tl.constexpr = 1e-12,
+):
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(0)
 
-    offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]
+    offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]  # NOTE: this will read OOB if M%128!=0
     offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
-    x = tl.load(x_ptr + offs_m * stride_xm + offs_n * stride_xn)  # [128, 64]
+    x = tl.load(
+        x_ptr + offs_m * stride_xm + offs_n * stride_xn,
+        mask=offs_m < M,
+    )  # [128, 64]
     x_blocks = x.to(tl.float32).reshape(128, 4, 16)  # [128, 4, 16]
 
     tensor_scale = tl.load(tensor_scale_ptr)
 
     block_amax = tl.max(x_blocks.abs(), axis=2)  # [128, 4]
-    scales_f32 = block_amax / tl.maximum(6.0 * tensor_scale, 1e-12)
+    scales_f32 = block_amax * (1.0 / tl.maximum(6.0 * tensor_scale, eps))
     scales_f32 = tl.minimum(tl.maximum(scales_f32, -448.0), 448.0)
     scales = scales_f32.to(tl.float8e4nv)
 
@@ -190,7 +207,8 @@ def quantize_nvfp4_triton_kernel(x_ptr, tensor_scale_ptr, q_ptr, s_ptr, stride_x
     offs_n = tl.arange(0, 16)[None, :]
     tl.store(s_ptr + (pid_m * tl.num_programs(0) + pid_n) * (32 * 16) + offs_m * 16 + offs_n, packed_scales)
 
-    x_blocks = x_blocks / tl.maximum(scales.to(tl.float32)[:, :, None] * tensor_scale, 1e-12)
+    inv_scales = 1.0 / tl.maximum(scales.to(tl.float32)[:, :, None] * tensor_scale, 1e-12)
+    x_blocks = x_blocks * inv_scales
     x_fp4x2 = tl.inline_asm_elementwise(
         asm="""
         {
@@ -214,43 +232,21 @@ def quantize_nvfp4_triton_kernel(x_ptr, tensor_scale_ptr, q_ptr, s_ptr, stride_x
     )  # (128, 32)
     offs_m = pid_m * 128 + tl.arange(0, 128)[:, None]
     offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
-    tl.store(q_ptr + offs_m * (N // 2) + offs_n, x_fp4x2)
+    tl.store(
+        q_ptr + offs_m * (N // 2) + offs_n,
+        x_fp4x2,
+        mask=offs_m < M,
+    )
 
 
-def quantize_nvfp4_triton(x: Tensor, tensor_scale: Tensor):
+def quantize_nvfp4_triton(x: Tensor, tensor_scale: Tensor, eps: float = 1e-12):
     M, N = x.shape
-    assert M % 128 == 0 and N % 64 == 0
+    assert N % 64 == 0
+    Msf = triton.cdiv(M, 128) * 128
     xq = x.new_empty(M, N // 2, dtype=torch.int8)
-    scales = x.new_empty(M, N // 16, dtype=torch.float8_e4m3fn)
+    scales = x.new_empty(Msf, N // 16, dtype=torch.float8_e4m3fn)
 
-    grid = (N // 64, M // 128)
-    quantize_nvfp4_triton_kernel[grid](x, tensor_scale, xq, scales, x.stride(0), x.stride(1), N)
+    grid = (N // 64, Msf // 128)
+    quantize_nvfp4_triton_kernel[grid](x, tensor_scale, xq, scales, x.stride(0), x.stride(1), M, N, eps=eps)
 
     return xq.view(torch.float4_e2m1fn_x2), scales
-
-
-def do_bench(f, num: int, num_warmup: int = 10):
-    start_list = [torch.cuda.Event(enable_timing=True) for _ in range(num)]
-    end_list = [torch.cuda.Event(enable_timing=True) for _ in range(num)]
-
-    A = torch.randn(1024, 1024, dtype=torch.bfloat16, device="cuda")
-    B = torch.randn(1024, 1024, dtype=torch.bfloat16, device="cuda")
-
-    l2_size = torch.cuda.get_device_properties().L2_cache_size
-    buf = torch.empty(l2_size * 2, dtype=torch.uint8, device="cuda")
-
-    # warmup
-    for _ in range(num_warmup):
-        f()
-
-    for start, end in zip(start_list, end_list):
-        buf.zero_()  # clear L2 cache
-        A @ B  # queue a slow job
-
-        start.record()
-        f()
-        end.record()
-
-    torch.cuda.synchronize()
-    timings = [start.elapsed_time(end) for start, end in zip(start_list, end_list)]
-    return statistics.mean(timings), statistics.stdev(timings)
