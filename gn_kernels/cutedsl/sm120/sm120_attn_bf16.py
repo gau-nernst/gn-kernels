@@ -7,7 +7,7 @@ from cutlass import BFloat16, Float32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from .utils import mma_sync, permute, simple_tma_g2s
+from ..utils import mma_sync, permute, simple_tma_g2s
 
 
 class Sm120Attn:

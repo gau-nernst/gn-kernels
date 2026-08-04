@@ -9,7 +9,7 @@ from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_tensor
 
-from .utils import mma_sync_mxfp8, permute, simple_tma_g2s, tma_g2s
+from ..utils import mma_sync_mxfp8, permute, simple_tma_g2s, tma_g2s
 
 
 class Sm120MatmulMXFP8:

@@ -10,7 +10,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from torch import Tensor
 
-from .utils import TORCH_TO_CUTE_DTYPE, mma_sync, permute
+from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync, permute
 
 
 class Sm80Matmul:

@@ -8,7 +8,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from cutlass.utils import get_smem_capacity_in_bytes
 
-from .utils import _tcgen05, mbarrier, simple_tma_g2s, to_cta0_smem
+from ..utils import mbarrier, simple_tma_g2s, to_cta0_smem
+from . import _tcgen05
 
 
 class Sm100MatmulBF16:
