@@ -256,21 +256,18 @@ class Sm100GemmRsBF16:
             tiled_copy = cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
             thread_copy = tiled_copy.get_slice(tid_)
 
+            input_tiles = cute.zipped_divide(partial_mc, (stripe_m, BN))
+            output_tiles = cute.zipped_divide(output, (stripe_m, BN))
+
             for bid in range(raw_bid, total_tiles, num_bids):
-                bid_m = bid % grid_m
+                bid_m_rs = bid % grid_m
                 bid_n = bid // grid_m
 
-                output_tile_m = bid_m % local_grid_m
-                chunk_id = bid_m // local_grid_m
-                target_tile_m = output_tile_m + self.rank * local_grid_m
+                # map to GEMM tile coordinate
+                bid_m_gemm = self.rank * local_grid_m + bid_m_rs // num_ranks
 
-                input_tile = cute.local_tile(partial_mc, (BM, BN), (target_tile_m, bid_n))
-                output_tile = cute.local_tile(output, (BM, BN), (output_tile_m, bid_n))
-                input_chunks = cute.zipped_divide(input_tile, (stripe_m, BN))
-                output_chunks = cute.zipped_divide(output_tile, (stripe_m, BN))
-
-                input_chunk = cute.slice_(input_chunks, ((None, None), (chunk_id, 0)))
-                output_chunk = cute.slice_(output_chunks, ((None, None), (chunk_id, 0)))
+                input_chunk = input_tiles[(None, None), (self.rank * grid_m + bid_m_rs, bid_n)]
+                output_chunk = output_tiles[(None, None), (bid_m_rs, bid_n)]
 
                 thread_input = thread_copy.partition_S(input_chunk)
                 thread_output = thread_copy.partition_S(output_chunk)
@@ -280,7 +277,7 @@ class Sm100GemmRsBF16:
                 # acquire fence is not needed because multimem.ld_reduce will
                 # read each rank's local L2 (don't need to invalidate L1).
                 if tid_ == 0:
-                    flag_ptr = flags_uc_ptr + target_tile_m + bid_n * grid_m
+                    flag_ptr = flags_uc_ptr + bid_n * grid_m + bid_m_gemm
                     flag_value = cute.arch.load(flag_ptr, Int32, sem="relaxed", scope="gpu")
                     while flag_value < num_ranks:
                         nanosleep(64)
@@ -306,7 +303,7 @@ class Sm100GemmRsBF16:
                 # finish using the GEMM tile
                 # last consumer reset the flag
                 if tid_ == 0:
-                    flag_ptr = flags_uc_ptr + target_tile_m + bid_n * grid_m
+                    flag_ptr = flags_uc_ptr + bid_n * grid_m + bid_m_gemm
                     old = cute.arch.atomic_add(flag_ptr, Int32(1), sem="relaxed", scope="gpu")
                     if old == num_ranks * 2 - 1:
                         cute.arch.store(flag_ptr, Int32(0), sem="relaxed", scope="gpu")
