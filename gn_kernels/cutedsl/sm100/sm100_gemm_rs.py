@@ -1,5 +1,5 @@
-# refer to https://github.com/NVIDIA/cutlass/issues/3117 for a more detailed
-# explanation on memory semantics used here.
+# based on https://github.com/NVIDIA/cutlass/blob/dcf215af68a2d08d305076c152a06f201728cd53/examples/python/CuTeDSL/cute/blackwell/kernel/distributed/distributed_gemm_reduce_scatter_blackwell.py
+# refer to https://github.com/NVIDIA/cutlass/issues/3117 for a more detailed explanation on memory semantics used here.
 
 from functools import cache
 
