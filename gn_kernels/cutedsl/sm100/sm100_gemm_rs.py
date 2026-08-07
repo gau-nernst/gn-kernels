@@ -439,7 +439,6 @@ class Sm100GemmRsBF16:
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm100GemmRsBF16(rank, num_ranks, BN, cta_group)
-        kernel.__call__.set_name_prefix(f"gn_gemm_rs_bn{BN}_r{rank}_w{num_ranks}")
         return cute.compile(
             kernel,
             A,
