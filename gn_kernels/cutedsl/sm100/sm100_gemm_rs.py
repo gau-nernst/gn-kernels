@@ -9,19 +9,55 @@ import torch.distributed as dist
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Int32, Int64, Uint16, cute, utils
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import nvvm, vector
+from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor, make_ptr, nullptr
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils import get_smem_capacity_in_bytes
 
-from ..utils import mbarrier, simple_tma_g2s, to_cta0_smem
+from ..utils import mbarrier, permute, simple_tma_g2s, to_cta0_smem
 from . import _tcgen05
 
 
 @dsl_user_op
 def nanosleep(ns: int, *, loc=None, ip=None) -> None:
     nvvm.nanosleep(Int32(ns).ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+
+
+@dsl_user_op
+def multimem_ld_reduce_16B(
+    x: cute.Tensor,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    # NOTE: assume x is contiguous
+    if x.element_type == BFloat16:
+        vec_type = ".v4.bf16x2"
+    else:
+        raise ValueError
+
+    ptr = x.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    struct = llvm.inline_asm(
+        llvm.StructType.get_literal([Int32.mlir_type] * 4),
+        [ptr],
+        f"multimem.ld_reduce.relaxed.gpu.global.add.acc::f32{vec_type} {{$0, $1, $2, $3}}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    vec = vector.from_elements(
+        ir.VectorType.get([4], Int32.mlir_type, loc=loc),
+        [llvm.extractvalue(Int32.mlir_type, struct, [i], loc=loc, ip=ip) for i in range(4)],
+        loc=loc,
+        ip=ip,
+    )
+    ssa = cute.TensorSSA(vec, 4, Int32)
+
+    y = cute.make_rmem_tensor(4, Int32)
+    y.store(ssa)
+    return cute.recast_tensor(y, x.element_type)
 
 
 class Sm100GemmRsBF16:
@@ -244,20 +280,22 @@ class Sm100GemmRsBF16:
             warp_id_ = warp_id % 4
             tid_ = tid % 128
 
-            stripe_m = BM // num_ranks
+            # each thread issues multimem.ld_reduce for BF16x8
+            cols = BN // 8
+            rows = 128 // cols
 
-            atom_elements = 8
-            total_comm_threads = 4 * cute.arch.WARP_SIZE
-            threads_n = BN // atom_elements
-            threads_m = total_comm_threads // threads_n
-            thread_layout = cute.make_layout((threads_m, threads_n), stride=(threads_n, 1))
-            value_layout = cute.make_layout((1, atom_elements), stride=(atom_elements, 1))
-            copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16)
-            tiled_copy = cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
-            thread_copy = tiled_copy.get_slice(tid_)
+            # ((8,cols),(rows,local_BM/rows), (N/BN,M/local_BM))
+            local_BM = BM // num_ranks
+            tiler = (cute.make_layout((8, cols)), cute.make_layout((rows, local_BM // rows)))
+            input_view = cute.zipped_divide(permute(partial_mc, (1, 0)), tiler)
+            output_view = cute.zipped_divide(permute(output, (1, 0)), tiler)
 
-            input_tiles = cute.zipped_divide(partial_mc, (stripe_m, BN))
-            output_tiles = cute.zipped_divide(output, (stripe_m, BN))
+            # (8,local_BM/rows, (N/BN,M/local_BM))
+            idx = (((None, tid_ % cols), (tid_ // cols, None)), None)
+            input_view = input_view[idx]
+            output_view = output_view[idx]
+
+            st_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
 
             for bid in range(raw_bid, total_tiles, num_bids):
                 bid_m_rs = bid % grid_m
@@ -266,12 +304,9 @@ class Sm100GemmRsBF16:
                 # map to GEMM tile coordinate
                 bid_m_gemm = self.rank * local_grid_m + bid_m_rs // num_ranks
 
-                input_chunk = input_tiles[(None, None), (self.rank * grid_m + bid_m_rs, bid_n)]
-                output_chunk = output_tiles[(None, None), (bid_m_rs, bid_n)]
-
-                thread_input = thread_copy.partition_S(input_chunk)
-                thread_output = thread_copy.partition_S(output_chunk)
-                _, loop_m, loop_n = thread_input.shape
+                # (8,local_BM/rows)
+                input_tile = input_view[None, None, (bid_n, self.rank * grid_m + bid_m_rs)]
+                output_tile = output_view[None, None, (bid_n, bid_m_rs)]
 
                 # relaxed poll with gpu scope since we are polling local L2.
                 # acquire fence is not needed because multimem.ld_reduce will
@@ -285,19 +320,11 @@ class Sm100GemmRsBF16:
                 cute.arch.barrier(barrier_id=BAR_COMM, number_of_threads=128)
 
                 results = []
-                for i in cutlass.range_constexpr(loop_m):
-                    for j in cutlass.range_constexpr(loop_n):
-                        out = utils.distributed.multimem_ld_reduce(
-                            thread_input[None, i, j].iterator, dtype=BFloat16, num_elements=atom_elements
-                        )
-                        results.append(out)
+                for i in cutlass.range_constexpr(local_BM // rows):
+                    results.append(multimem_ld_reduce_16B(input_tile[None, i]))
 
-                for i in cutlass.range_constexpr(loop_m):
-                    for j in cutlass.range_constexpr(loop_n):
-                        x, y, z, w = results[i * loop_n + j]
-                        vec_type = ir.VectorType.get([4], Int32.mlir_type)
-                        value = vector.from_elements(vec_type, [x, y, z, w])
-                        cute.arch.store(thread_output[None, i, j].iterator, value)
+                for i in cutlass.range_constexpr(local_BM // rows):
+                    cute.copy(st_atom, results[i], output_tile[None, i])
                 cute.arch.barrier(barrier_id=BAR_COMM, number_of_threads=128)
 
                 # finish using the GEMM tile
