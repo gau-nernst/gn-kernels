@@ -99,13 +99,13 @@ class Sm80Matmul:
         # pre-compute ldmatrix address (16x16 tile)
         # ((16, (16B, 2), 1), (WM/16, BK/32B, num_stages))
         elems = 128 // dtype.width  # elements to cover 16B row
-        sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((elems, 2)), 1))
-        sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((elems, 2)), 1))
+        sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((elems, 2))))
+        sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((elems, 2))))
 
         # select the address
         # (16B, (WM/16, BK/32B, num_stages))
-        sA_ldsm = sA_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
-        sB_ldsm = sB_ldsm[((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2), 0), None]
+        sA_ldsm = sA_ldsm[(lane_id % 16, (None, lane_id // 16)), None]
+        sB_ldsm = sB_ldsm[((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2)), None]
 
         # ldmatrix.x4
         ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
