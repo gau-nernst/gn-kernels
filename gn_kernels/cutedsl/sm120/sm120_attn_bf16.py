@@ -195,9 +195,8 @@ class Sm120Attn:
 
                     # butterfly reduction within 4 threads
                     for i in cutlass.range_constexpr(2):
-                        offset = 1 << i
-                        other0 = cute.arch.shuffle_sync_bfly(rM_new0, 0xFFFF_FFFF, offset)
-                        other1 = cute.arch.shuffle_sync_bfly(rM_new1, 0xFFFF_FFFF, offset)
+                        other0 = cute.arch.shuffle_sync_bfly(rM_new0, 1 << i)
+                        other1 = cute.arch.shuffle_sync_bfly(rM_new1, 1 << i)
                         rM_new0 = cute.arch.fmax(rM_new0, other0)
                         rM_new1 = cute.arch.fmax(rM_new1, other1)
 
@@ -232,9 +231,8 @@ class Sm120Attn:
 
                     # butterfly reduction within 4 threads
                     for i in cutlass.range_constexpr(2):
-                        offset = 1 << i
-                        sumexp_new[0] += cute.arch.shuffle_sync_bfly(sumexp_new[0], 0xFFFF_FFFF, offset)
-                        sumexp_new[1] += cute.arch.shuffle_sync_bfly(sumexp_new[1], 0xFFFF_FFFF, offset)
+                        sumexp_new[0] += cute.arch.shuffle_sync_bfly(sumexp_new[0], 1 << i)
+                        sumexp_new[1] += cute.arch.shuffle_sync_bfly(sumexp_new[1], 1 << i)
 
                     sumexp[0, m] = sumexp[0, m] * rescale0 + sumexp_new[0]
                     sumexp[1, m] = sumexp[1, m] * rescale1 + sumexp_new[1]

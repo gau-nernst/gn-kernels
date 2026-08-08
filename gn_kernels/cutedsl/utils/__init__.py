@@ -1,6 +1,6 @@
 import cutlass
 import torch
-from cutlass import Int16, Int32, cute
+from cutlass import Int16, Int32, Int64, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
@@ -29,6 +29,11 @@ CUTE_TO_PTX_DTYPE = {
     cutlass.Int32: "s32",
     cutlass.Uint32: "u32",
 }
+
+# https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
+EVICT_NORMAL = Int64(0x1000000000000000)
+EVICT_FIRST = Int64(0x12F0000000000000)
+EVICT_LAST = Int64(0x14F0000000000000)
 
 
 def simple_tma_g2s(atom, src, dst, mbar):
