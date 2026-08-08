@@ -36,14 +36,14 @@ EVICT_FIRST = Int64(0x12F0000000000000)
 EVICT_LAST = Int64(0x14F0000000000000)
 
 
-def simple_tma_g2s(atom, src, dst, mbar):
+def simple_tma_g2s(atom, src, dst, mbar, cache_policy=None):
     """A simple helper that wraps group_modes() and tma_partition()
     NOTE: this should be called WITHOUT cute.elect_one()
     """
     dst = cute.group_modes(dst, 0)
     src = cute.group_modes(src, 0)
     s_part, g_part = cpasync.tma_partition(atom, 0, cute.make_layout(1), dst, src)
-    cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar)
+    cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar, cache_policy=cache_policy)
 
 
 @dsl_user_op
