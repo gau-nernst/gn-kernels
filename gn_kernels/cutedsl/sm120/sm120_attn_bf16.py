@@ -248,6 +248,7 @@ class Sm120Attn:
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
                 stage_id = (stage_id + 1) % 2
                 if stage_id == 0:

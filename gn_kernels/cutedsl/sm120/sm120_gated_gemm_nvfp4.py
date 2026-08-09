@@ -257,6 +257,7 @@ class Sm120GatedGemmNVFP4:
                                 Int16(n % 4),
                             )
 
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                 tma_stage = (tma_stage + 1) % num_stages
