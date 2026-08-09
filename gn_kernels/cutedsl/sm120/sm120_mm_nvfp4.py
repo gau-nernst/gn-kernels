@@ -166,7 +166,7 @@ class Sm120MatmulNVFP4:
 
             # select SF smem
             # logically, it looks like [32x4][32x4][32x4][32x4], times 4
-            # original shape: UE8M0 ((4, 4, 32, 4), num_stages)
+            # original shape: UE4M3 ((4, 4, 32, 4), num_stages)
             # new shape: Int32 (4, 4, num_stages)
             # why (lane_id % 4) * 8 + (lane_id // 4)? just stare at PTX doc
             sSFA_view = cute.recast_tensor(sSFA, Int32)[(0, None, (lane_id % 4) * 8 + (lane_id // 4), None), None]
@@ -209,10 +209,8 @@ class Sm120MatmulNVFP4:
                                 rB[(None, n % 2), n // 2, k],
                                 rC[None, n, m],
                                 rSFA[m // 2, k],
-                                Int16(0),
                                 Int16(m % 2),
                                 rSFB[n // 4, k],
-                                Int16(0),
                                 Int16(n % 4),
                             )
 
