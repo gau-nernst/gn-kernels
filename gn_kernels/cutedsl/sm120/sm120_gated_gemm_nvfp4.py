@@ -356,84 +356,155 @@ class Sm120GatedGemmNVFP4:
             W1_scale = gSFW1_tensor[0] * X_scale
             W3_scale = gSFW3_tensor[0] * X_scale
 
-            # swiglu then store to smem
-            stsm_op = warp.StMatrix8x8x16bOp(num_matrices=4)
-            stsm_atom = cute.make_copy_atom(stsm_op, BFloat16)
+            if cutlass.const_expr(gSFC_tensor is not None):
+                gSFC_ = cute.make_tensor(
+                    gSFC.iterator,
+                    cute.make_layout(
+                        ((M // 128, 4, 32), (N // 64, 4)),
+                        stride=((N * 8, 4, 16), (512, 1)),
+                    ),
+                )
+                self.quantize_epilogue(rO1, rO3, W1_scale, W3_scale, gC, gSFC_, gSFC_tensor, sX.iterator)
 
-            sTmp = cute.make_tensor(
-                cute.recast_ptr(sX.iterator, dtype=BFloat16),
-                cute.make_layout(((64, BN // 64), BM), stride=((1, BM * 64), 64)),
-            )
-            sTmp_warp = cute.local_tile(sTmp, (WN, WM), (warp_id_n, warp_id_m))
-            sTmp_stsm = cute.zipped_divide(sTmp_warp, (cute.make_layout((8, 2)), 16))  # (((8,2),16), (WN/16,WM/16))
-            sTmp_stsm = sTmp_stsm[((None, lane_id // 16), lane_id % 16), None]  # (8, (WN/16,WM/16))
+            else:
+                self.epilogue(rO1, rO3, W1_scale, W3_scale, gC)
 
-            for m in cutlass.range_constexpr(WM // 16):
-                tmp = cute.make_rmem_tensor(((4, 2), WN // 16), Float32)
+    @cute.jit
+    def epilogue(self, rO1: cute.Tensor, rO3: cute.Tensor, W1_scale: Float32, W3_scale: Float32, gC: cute.Tensor):
+        tid, _, _ = cute.arch.thread_idx()
+        bid_m, bid_n, _ = cute.arch.block_idx()
+        warp_id = cute.arch.make_warp_uniform(tid // 32)
+        lane_id = tid % 32
 
-                for n in cutlass.range_constexpr(WN // 8):
-                    for i in cutlass.range_constexpr(4):
-                        o1 = rO1[i, n, m] * W1_scale
-                        o3 = rO3[i, n, m] * W3_scale
-                        sigmoid = cute.arch.rcp_approx(1.0 + cute.exp(-o1))
-                        tmp[(i, n % 2), n // 2] = o1 * o3 * sigmoid
+        BM, BN, _ = self.cta_tile
+        num_warp_m, num_warp_n = self.warp_layout
+        WM = BM // num_warp_m
+        WN = BN // num_warp_n
+        warp_id_m = warp_id // num_warp_n
+        warp_id_n = warp_id % num_warp_n
 
-                tmp_bf16 = cute.make_rmem_tensor((8, WN // 16), BFloat16)
-                tmp_bf16.store(tmp.load().to(BFloat16))
-                cute.copy(stsm_atom, tmp_bf16, sTmp_stsm[None, (None, m)])
+        # create view into C gmem
+        gC_cta = cute.local_tile(gC, tiler=(BM, BN), coord=(bid_m, bid_n))
+        gC_warp = cute.local_tile(gC_cta, tiler=(WM, WN), coord=(warp_id_m, warp_id_n))
 
-            tensor_scale = gSFC_tensor[0]
-            cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
+        # (((8,2),(2,4)), (WM/16,WN/8))
+        gC_view = cute.zipped_divide(gC_warp, (cute.make_layout((8, 2)), cute.make_layout((2, 4))))
 
-            # reload. each thread loads 8 BF16 elems
-            num_cols = BN // 8
-            num_rows = NUM_MMA_THREADS // num_cols
+        # (2, 2, (WM/16,WN/8))
+        gC_view = gC_view[((lane_id // 4, None), (None, lane_id % 4)), None]
+        gC_view = permute(gC_view, (1, 0, 2))
 
-            sTmp_view = cute.zipped_divide(sTmp, (8, num_rows))  # ((8,rows), (BN/8,BM/rows))
-            sTmp_view = sTmp_view[(None, tid // num_cols), (tid % num_cols, None)]  # (8, BM/rows)
+        # explicit for loop to interleave cvt with st.global
+        for m in cutlass.range_constexpr(WM // 16):
+            for n in cutlass.range_constexpr(WN // 8):
+                tmp_f32 = cute.make_rmem_tensor(4, Float32)
+                for i in cutlass.range_constexpr(4):
+                    o1 = rO1[i, n, m] * W1_scale
+                    o3 = rO3[i, n, m] * W3_scale
+                    sigmoid = cute.arch.rcp_approx(1.0 + cute.exp(-o1))
+                    tmp_f32[i] = o1 * o3 * sigmoid
 
-            # create view into C gmem
-            gC_cta = cute.local_tile(permute(gC, (1, 0)), tiler=(BN, BM), coord=(bid_n, bid_m))
-            gC_view = cute.zipped_divide(gC_cta, (8, num_rows))
-            gC_view = gC_view[(None, tid // num_cols), (tid % num_cols, None)]
+                tmp = cute.make_rmem_tensor((2, 2), BFloat16)
+                tmp.store(tmp_f32.load().to(BFloat16))
+                stg_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=32)
+                cute.copy(stg_atom, tmp, gC_view[None, None, (m, n)])
 
-            gSFC_ = cute.make_tensor(
-                gSFC.iterator,
-                cute.make_layout(
-                    ((M // 128, 4, 32), (N // 64, 4)),
-                    stride=((N * 8, 4, 16), (512, 1)),
-                ),
-            )
-            gSFC_cta = cute.local_tile(gSFC_, (BM, BN // 16), (bid_m, bid_n))
+    @cute.jit
+    def quantize_epilogue(
+        self,
+        rO1: cute.Tensor,
+        rO3: cute.Tensor,
+        W1_scale: Float32,
+        W3_scale: Float32,
+        gC: cute.Tensor,
+        gSFC: cute.Tensor,
+        gSFC_tensor: cute.Tensor,
+        smem_ptr: cute.Pointer,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        bid_m, bid_n, _ = cute.arch.block_idx()
+        warp_id = cute.arch.make_warp_uniform(tid // 32)
+        lane_id = tid % 32
 
-            for i in cutlass.range_constexpr(BM // num_rows):
-                lds_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
-                tmp = cute.make_rmem_tensor(8, BFloat16)
-                cute.copy(lds_atom, sTmp_view[None, i], tmp)
+        BM, BN, _ = self.cta_tile
+        num_warp_m, num_warp_n = self.warp_layout
+        WM = BM // num_warp_m
+        WN = BN // num_warp_n
+        NUM_MMA_THREADS = math.prod(self.warp_layout) * 32
+        warp_id_m = warp_id // num_warp_n
+        warp_id_n = warp_id % num_warp_n
 
-                tmp_bf16x2 = cute.recast_tensor(tmp, Uint32)
-                amax = cute.make_rmem_tensor(1, Uint32)
-                amax.fill(0)
-                for j in cutlass.range_constexpr(4):
-                    amax[0] = _bf16x2_max(amax[0], _bf16x2_abs(tmp_bf16x2[j]))
-                amax[0] = _bf16x2_max(amax[0], cute.arch.shuffle_sync_bfly(amax[0], 1))
+        # swiglu then store to smem
+        stsm_op = warp.StMatrix8x8x16bOp(num_matrices=4)
+        stsm_atom = cute.make_copy_atom(stsm_op, BFloat16)
 
-                amax_bf16 = cute.recast_tensor(amax, BFloat16)
-                amax_f32 = cute.arch.fmax(amax_bf16[0], amax_bf16[1])
+        sTmp = cute.make_tensor(
+            cute.recast_ptr(smem_ptr, dtype=BFloat16),
+            cute.make_layout(((64, BN // 64), BM), stride=((1, BM * 64), 64)),
+        )
+        sTmp_warp = cute.local_tile(sTmp, (WN, WM), (warp_id_n, warp_id_m))
+        sTmp_stsm = cute.zipped_divide(sTmp_warp, (cute.make_layout((8, 2)), 16))  # (((8,2),16), (WN/16,WM/16))
+        sTmp_stsm = sTmp_stsm[((None, lane_id // 16), lane_id % 16), None]  # (8, (WN/16,WM/16))
 
-                scale_f32 = amax_f32 * cute.rcp(cute.max(6.0 * tensor_scale, 1e-12), approx=True)
-                scale_f32 = cute.arch.fmin(cute.arch.fmax(scale_f32, -448.0), 448.0)
-                scale_f8 = scale_f32.to(Float8E4M3FN)
-                if tid % 2 == 0:
-                    gSFC_cta[i * num_rows + tid // num_cols, (tid % num_cols) // 2] = scale_f8
+        for m in cutlass.range_constexpr(WM // 16):
+            tmp = cute.make_rmem_tensor(((4, 2), WN // 16), Float32)
 
-                inv_scale = cute.rcp(cute.max(scale_f8.to(Float32) * tensor_scale, 1e-12), approx=True)
-                out = tmp.load().to(Float32) * inv_scale
-                cute.arch.store(gC_view[None, i].iterator, _f32x8_to_f4x8(out))
+            for n in cutlass.range_constexpr(WN // 8):
+                for i in cutlass.range_constexpr(4):
+                    o1 = rO1[i, n, m] * W1_scale
+                    o3 = rO3[i, n, m] * W3_scale
+                    sigmoid = cute.arch.rcp_approx(1.0 + cute.exp(-o1))
+                    tmp[(i, n % 2), n // 2] = o1 * o3 * sigmoid
+
+            tmp_bf16 = cute.make_rmem_tensor((8, WN // 16), BFloat16)
+            tmp_bf16.store(tmp.load().to(BFloat16))
+            cute.copy(stsm_atom, tmp_bf16, sTmp_stsm[None, (None, m)])
+
+        tensor_scale = gSFC_tensor[0]
+        cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
+
+        # reload. each thread loads 8 BF16 elems
+        num_cols = BN // 8
+        num_rows = NUM_MMA_THREADS // num_cols
+
+        sTmp_view = cute.zipped_divide(sTmp, (8, num_rows))  # ((8,rows), (BN/8,BM/rows))
+        sTmp_view = sTmp_view[(None, tid // num_cols), (tid % num_cols, None)]  # (8, BM/rows)
+
+        # create view into C gmem
+        gC_cta = cute.local_tile(permute(gC, (1, 0)), tiler=(BN, BM), coord=(bid_n, bid_m))
+        gC_view = cute.zipped_divide(gC_cta, (8, num_rows))
+        gC_view = gC_view[(None, tid // num_cols), (tid % num_cols, None)]
+
+        gSFC_cta = cute.local_tile(gSFC, (BM, BN // 16), (bid_m, bid_n))
+
+        for i in cutlass.range_constexpr(BM // num_rows):
+            lds_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
+            tmp = cute.make_rmem_tensor(8, BFloat16)
+            cute.copy(lds_atom, sTmp_view[None, i], tmp)
+
+            tmp_bf16x2 = cute.recast_tensor(tmp, Uint32)
+            amax = cute.make_rmem_tensor(1, Uint32)
+            amax.fill(0)
+            for j in cutlass.range_constexpr(4):
+                amax[0] = _bf16x2_max(amax[0], _bf16x2_abs(tmp_bf16x2[j]))
+            amax[0] = _bf16x2_max(amax[0], cute.arch.shuffle_sync_bfly(amax[0], 1))
+
+            amax_bf16 = cute.recast_tensor(amax, BFloat16)
+            amax_f32 = cute.arch.fmax(amax_bf16[0], amax_bf16[1])
+
+            scale_f32 = amax_f32 * cute.rcp(cute.max(6.0 * tensor_scale, 1e-12), approx=True)
+            scale_f32 = cute.arch.fmin(cute.arch.fmax(scale_f32, -448.0), 448.0)
+            scale_f8 = scale_f32.to(Float8E4M3FN)
+            if tid % 2 == 0:
+                gSFC_cta[i * num_rows + tid // num_cols, (tid % num_cols) // 2] = scale_f8
+
+            inv_scale = cute.rcp(cute.max(scale_f8.to(Float32) * tensor_scale, 1e-12), approx=True)
+            out = tmp.load().to(Float32) * inv_scale
+            cute.arch.store(gC_view[None, i].iterator, _f32x8_to_f4x8(out))
 
     @cache
     @staticmethod
-    def compile():
+    def compile(quantize_epilogue: bool):
         M = cute.sym_int()
         N = cute.sym_int(divisibility=2)
         K = cute.sym_int(divisibility=2)
@@ -447,9 +518,15 @@ class Sm120GatedGemmNVFP4:
         SFX_tensor = make_fake_tensor(Float32, (1,), (0,), assumed_align=16)
         SFW1_tensor = make_fake_tensor(Float32, (1,), (0,), assumed_align=16)
         SFW3_tensor = make_fake_tensor(Float32, (1,), (0,), assumed_align=16)
-        C = make_fake_tensor(Float4E2M1FN, (M, N), (cute.sym_int64(32), 1), assumed_align=16)
-        SFC = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
-        SFC_tensor = make_fake_tensor(Float32, (1,), (0,), assumed_align=16)
+
+        if quantize_epilogue:
+            C = make_fake_tensor(Float4E2M1FN, (M, N), (cute.sym_int64(32), 1), assumed_align=16)
+            SFC = make_fake_tensor(Float8E4M3FN, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
+            SFC_tensor = make_fake_tensor(Float32, (1,), (0,), assumed_align=16)
+        else:
+            C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
+            SFC = None
+            SFC_tensor = None
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm120GatedGemmNVFP4()
@@ -482,13 +559,23 @@ def mm(
     W3: torch.Tensor,
     SFW3: torch.Tensor,
     SFW3_tensor: torch.Tensor,
-    SFC_tensor: torch.Tensor,
+    SFC_tensor: torch.Tensor | None = None,
 ):
     M, _ = X.shape
     N, _ = W1.shape
-    C = X.new_empty(M, N // 2, dtype=torch.float4_e2m1fn_x2)
-    SFC = X.new_empty(M, N // 16, dtype=torch.float8_e4m3fn)
-    Sm120GatedGemmNVFP4.compile()(
+
+    quantize_epilogue = SFC_tensor is not None
+    kernel = Sm120GatedGemmNVFP4.compile(quantize_epilogue)
+
+    if quantize_epilogue:
+        C = X.new_empty(M, N // 2, dtype=torch.float4_e2m1fn_x2)
+        SFC = X.new_empty(M * (N // 16), dtype=torch.float8_e4m3fn)
+        SFC_tensor = SFC_tensor.view(-1)
+    else:
+        C = X.new_empty(M, N, dtype=torch.bfloat16)
+        SFC = None
+
+    kernel(
         X,
         SFX.view(-1),
         SFX_tensor.view(-1),
@@ -499,7 +586,7 @@ def mm(
         SFW3.view(-1),
         SFW3_tensor.view(-1),
         C,
-        SFC.view(-1),
-        SFC_tensor.view(-1),
+        SFC,
+        SFC_tensor,
     )
-    return C, SFC
+    return (C, SFC.view(M, N // 16)) if quantize_epilogue else C
