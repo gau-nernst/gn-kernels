@@ -14,44 +14,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from ..utils import mma_sync_nvfp4, permute, simple_tma_g2s, tma_g2s
 
 
-def _bf16x2_unary(asm: str, a: Uint32, *, loc=None, ip=None) -> Uint32:
-    out = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip)],
-        f"{asm}.bf16x2 $0, $1;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
-    return Uint32(out)
-
-
-def _bf16x2_binary(asm: str, a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    out = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
-        f"{asm}.bf16x2 $0, $1, $2;",
-        "=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
-    return Uint32(out)
-
-
-@dsl_user_op
-def _bf16x2_abs(a: Uint32, *, loc=None, ip=None) -> Uint32:
-    return _bf16x2_unary("abs", a, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _bf16x2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    return _bf16x2_binary("max", a, b, loc=loc, ip=ip)
-
-
 @dsl_user_op
 def _f32x8_to_f4x8(x: cute.Tensor, *, loc=None, ip=None) -> Uint32:
     # NOTE: lower elem is stored as higher nibble
@@ -360,8 +322,8 @@ class Sm120GatedGemmNVFP4:
                 gSFC_ = cute.make_tensor(
                     gSFC.iterator,
                     cute.make_layout(
-                        ((M // 128, 4, 32), (N // 64, 4)),
-                        stride=((N * 8, 4, 16), (512, 1)),
+                        ((32, 4, M // 128), (4, N // 64)),
+                        stride=((16, 4, N * 8), (1, 512)),
                     ),
                 )
                 self.quantize_epilogue(rO1, rO3, W1_scale, W3_scale, gC, gSFC_, gSFC_tensor, sX.iterator)
@@ -482,25 +444,24 @@ class Sm120GatedGemmNVFP4:
             tmp = cute.make_rmem_tensor(8, BFloat16)
             cute.copy(lds_atom, sTmp_view[None, i], tmp)
 
-            tmp_bf16x2 = cute.recast_tensor(tmp, Uint32)
-            amax = cute.make_rmem_tensor(1, Uint32)
-            amax.fill(0)
-            for j in cutlass.range_constexpr(4):
-                amax[0] = _bf16x2_max(amax[0], _bf16x2_abs(tmp_bf16x2[j]))
-            amax[0] = _bf16x2_max(amax[0], cute.arch.shuffle_sync_bfly(amax[0], 1))
+            tmp_f32 = cute.make_rmem_tensor(8, Float32)
+            tmp_f32.store(tmp.load().to(Float32))
 
-            amax_bf16 = cute.recast_tensor(amax, BFloat16)
-            amax_f32 = cute.arch.fmax(amax_bf16[0], amax_bf16[1])
+            # tried using bf16x2 math here, but the compiler has correctness issue (eliminate code).
+            amax_f32 = Float32(0)
+            for j in cutlass.range_constexpr(8):
+                amax_f32 = cute.arch.fmax(amax_f32, cute.abs(tmp_f32[j]))
+            amax_f32 = cute.arch.fmax(amax_f32, cute.arch.shuffle_sync_bfly(amax_f32, 1))
 
-            scale_f32 = amax_f32 * cute.rcp(cute.max(6.0 * tensor_scale, 1e-12), approx=True)
+            scale_f32 = amax_f32 * cute.rcp(cute.arch.fmax(6.0 * tensor_scale, 1e-12), approx=True)
             scale_f32 = cute.arch.fmin(cute.arch.fmax(scale_f32, -448.0), 448.0)
             scale_f8 = scale_f32.to(Float8E4M3FN)
             if tid % 2 == 0:
                 gSFC_cta[i * num_rows + tid // num_cols, (tid % num_cols) // 2] = scale_f8
 
-            inv_scale = cute.rcp(cute.max(scale_f8.to(Float32) * tensor_scale, 1e-12), approx=True)
-            out = tmp.load().to(Float32) * inv_scale
-            cute.arch.store(gC_view[None, i].iterator, _f32x8_to_f4x8(out))
+            inv_scale = cute.rcp(cute.arch.fmax(scale_f8.to(Float32) * tensor_scale, 1e-12), approx=True)
+            out = _f32x8_to_f4x8(tmp_f32.load() * inv_scale)
+            cute.arch.store(gC_view[None, i].iterator, out)
 
     @cache
     @staticmethod
