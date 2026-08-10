@@ -13,18 +13,25 @@ from ..utils import mma_sync, permute, simple_tma_g2s
 class Sm120Attn:
     DIM: int = 128
     BQ: int = 64
-    BK: int = 128
+    BK: int = 64
+    num_stages: int = 3
 
     def __init__(self, num_heads: int):
         self.num_heads = num_heads
 
     @cute.jit
-    def prepare_tma(self, x: cute.Tensor, BLOCK: cutlass.Constexpr[int], tma_op: cpasync.TmaCopyOp):
+    def prepare_tma(
+        self,
+        x: cute.Tensor,
+        BLOCK: cutlass.Constexpr[int],
+        num_stages: cutlass.Constexpr[int],
+        tma_op: cpasync.TmaCopyOp,
+    ):
         # x: [B, L, H, D]
         swizzle = cute.make_swizzle(3, 4, 3)  # 128B
         s_layout = cute.make_layout(
-            (1, BLOCK, 1, (64, self.DIM // 64)),
-            stride=(0, 64, 0, (1, BLOCK * 64)),
+            (1, BLOCK, 1, (64, self.DIM // 64), num_stages),
+            stride=(0, 64, 0, (1, BLOCK * 64), BLOCK * self.DIM),
         )
         s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
         return cpasync.make_tiled_tma_atom(tma_op, x, s_layout, (1, BLOCK, 1, self.DIM))
@@ -34,9 +41,9 @@ class Sm120Attn:
         B, Lq, _, _ = gQ.shape
 
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
-        Q_tma = self.prepare_tma(gQ, self.BQ, tma_g2s)
-        K_tma = self.prepare_tma(gK, self.BK, tma_g2s)
-        V_tma = self.prepare_tma(gV, self.BK, tma_g2s)
+        Q_tma = self.prepare_tma(gQ, self.BQ, self.num_stages, tma_g2s)
+        K_tma = self.prepare_tma(gK, self.BK, self.num_stages, tma_g2s)
+        V_tma = self.prepare_tma(gV, self.BK, 1, tma_g2s)
 
         grid = (cute.ceil_div(Lq, self.BQ), self.num_heads, B)
         block = (5 * 32, 1, 1)
@@ -54,26 +61,32 @@ class Sm120Attn:
         BK = self.BK
         DIM = self.DIM
         WQ = BQ // 4
+        num_stages = self.num_stages
 
         # allocate smem
         def allocate_smem(smem, s_layout):
             return smem.allocate_tensor(BFloat16, s_layout.outer, byte_alignment=128, swizzle=s_layout.inner)
 
+        # K and V share the same smem slots
         smem = cutlass.utils.SmemAllocator()
-        sK = allocate_smem(smem, K_tma.smem_layout)[0, None, 0, None]
-        sV = allocate_smem(smem, V_tma.smem_layout)[0, None, 0, None]
+        sK = allocate_smem(smem, K_tma.smem_layout)[0, None, 0, None, None]
+        sV = cute.make_tensor(sK.iterator, V_tma.smem_layout.outer)[0, None, 0, None, None]
 
         # alias
-        sQ = cute.make_tensor(sK.iterator, Q_tma.smem_layout.outer)[0, None, 0, None]
+        sQ = cute.make_tensor(sK.iterator, Q_tma.smem_layout.outer)[0, None, 0, None, 0]
 
-        tma_full_mbar = smem.allocate_array(Int64, 2)
-        tma_empty_mbar = smem.allocate_array(Int64, 2)
+        tma_q_full_mbar = smem.allocate_array(Int64, 1)
+        tma_q_empty_mbar = smem.allocate_array(Int64, 1)
+        tma_full_mbar = smem.allocate_array(Int64, num_stages)
+        tma_empty_mbar = smem.allocate_array(Int64, num_stages)
 
         BAR_MMA = 1
 
         if warp_id == 0:
             with cute.arch.elect_one():
-                for i in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_init(tma_q_full_mbar, 1)
+                cute.arch.mbarrier_init(tma_q_empty_mbar, 128)
+                for i in cutlass.range_constexpr(num_stages):
                     cute.arch.mbarrier_init(tma_full_mbar + i, 1)
                     cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
                 cute.arch.mbarrier_init_fence()
@@ -85,27 +98,29 @@ class Sm120Attn:
 
         if warp_id == 4:
             # TMA warp
+            # load Q
             gQ_tile = cute.local_tile(Q_tma.tma_tensor[batch_id, None, head_id, None], (BQ, DIM), (q_tile_id, 0))
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar, BQ * DIM * 2)
-            simple_tma_g2s(Q_tma.atom, gQ_tile, sQ, tma_full_mbar)
-            cute.arch.mbarrier_wait(tma_empty_mbar, 0)  # wait for Q to finish
+                cute.arch.mbarrier_arrive_and_expect_tx(tma_q_full_mbar, BQ * DIM * 2)
+            simple_tma_g2s(Q_tma.atom, gQ_tile, sQ, tma_q_full_mbar)
+            cute.arch.mbarrier_wait(tma_q_empty_mbar, 0)  # wait for Q to finish
+
+            # for KV
+            stage_id = 0
+            parity = 1
 
             # [block, head_dim, L/block]
             gK_tiles = cute.local_tile(K_tma.tma_tensor[batch_id, None, head_id, None], (BK, DIM), (None, 0))
             gV_tiles = cute.local_tile(V_tma.tma_tensor[batch_id, None, head_id, None], (BK, DIM), (None, 0))
             k_size = cutlass.const_expr(self.BK * self.DIM * 2)
 
-            stage_id = 1
-            parity = 1
-
             for iter_l in range(cute.ceil_div(Lk, BK)):
                 mbar = tma_full_mbar + stage_id
                 cute.arch.mbarrier_wait(tma_empty_mbar + stage_id, parity)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, k_size)
-                simple_tma_g2s(K_tma.atom, gK_tiles[None, None, iter_l], sK, mbar)
-                stage_id = (stage_id + 1) % 2
+                simple_tma_g2s(K_tma.atom, gK_tiles[None, None, iter_l], sK[None, None, stage_id], mbar)
+                stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
                     parity ^= 1
 
@@ -113,8 +128,8 @@ class Sm120Attn:
                 cute.arch.mbarrier_wait(tma_empty_mbar + stage_id, parity)
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, k_size)
-                simple_tma_g2s(V_tma.atom, gV_tiles[None, None, iter_l], sV, mbar)
-                stage_id = (stage_id + 1) % 2
+                simple_tma_g2s(V_tma.atom, gV_tiles[None, None, iter_l], sV[None, None, stage_id], mbar)
+                stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
                     parity ^= 1
 
@@ -144,20 +159,23 @@ class Sm120Attn:
 
             # wait for and load Q
             if warp_id == 0:
-                cute.arch.mbarrier_wait(tma_full_mbar, 0)
+                cute.arch.mbarrier_wait(tma_q_full_mbar, 0)
             cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
             cute.copy(ldsm_atom, sQ_ldsm, rQ)
-            cute.arch.mbarrier_arrive(tma_empty_mbar)
-            stage_id = 1
+            cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
+            cute.arch.mbarrier_arrive(tma_q_empty_mbar)
+
+            # for KV
+            stage_id = 0
             parity = 0
 
-            sK_ldsm = cute.zipped_divide(sK, (16, cute.make_layout((8, 2))))  # ((16,(8,2)), (BK/16,DIM/16))
+            sK_ldsm = cute.zipped_divide(sK, (16, cute.make_layout((8, 2))))  # ((16,(8,2)), (BK/16,DIM/16,num_stages))
             sK_ldsm = sK_ldsm[
-                ((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2)), (None, None)
-            ]  # (8, BK/16, DIM/16)
+                ((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2)), None
+            ]  # (8, (BK/16,DIM/16, num_stages))
 
-            sV_ldsm = cute.zipped_divide(sV, (16, cute.make_layout((8, 2))))  # ((16,(8,2)), (BK/16,DIM/16))
-            sV_ldsm = sV_ldsm[(lane_id % 16, (None, lane_id // 16)), (None, None)]  # (8, BK/16, DIM/16)
+            sV_ldsm = cute.zipped_divide(sV, (16, cute.make_layout((8, 2))))  # ((16,(8,2)), (BK/16,DIM/16,num_stages))
+            sV_ldsm = sV_ldsm[(lane_id % 16, (None, lane_id // 16)), None]  # (8, (BK/16,DIM/16,num_stages))
 
             # sqrt(dim) / ln(2)
             sm_scale = cutlass.const_expr(DIM ** (-0.5) * 1.4426950408889634)
@@ -170,13 +188,14 @@ class Sm120Attn:
 
                 # S = Q @ K.T
                 for k in cutlass.range_constexpr(DIM // 16):
-                    cute.copy(ldsm_atom, sK_ldsm[None, None, k], rK[None, None, k])
+                    cute.copy(ldsm_atom, sK_ldsm[None, (None, k, stage_id)], rK[None, None, k])
                     for m in cutlass.range_constexpr(WQ // 16):
                         for n in cutlass.range_constexpr(BK // 8):
                             rS[None, n, m] = mma_sync(rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m])
 
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
-                stage_id = (stage_id + 1) % 2
+                stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
                     parity ^= 1
 
@@ -243,13 +262,14 @@ class Sm120Attn:
 
                 # O += P @ V
                 for k in cutlass.range_constexpr(BK // 16):
-                    cute.copy(ldsm_trans_atom, sV_ldsm[None, k, None], rV[None, k, None])
+                    cute.copy(ldsm_trans_atom, sV_ldsm[None, (k, None, stage_id)], rV[None, k, None])
                     for m in cutlass.range_constexpr(WQ // 16):
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
-                stage_id = (stage_id + 1) % 2
+                stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
                     parity ^= 1
 

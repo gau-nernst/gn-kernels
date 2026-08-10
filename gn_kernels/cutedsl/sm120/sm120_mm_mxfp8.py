@@ -26,13 +26,6 @@ class Sm120MatmulMXFP8:
         return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
 
     @cute.jit
-    def prepare_SF(self, SF: cute.Tensor, M: Int32, K: Int32):
-        # NVIDIA SF layout in gmem
-        # if SF has shape [M, Ksf], it's permuted as [M/128, Ksf/4, 32, 4, 4]
-        g_layout = cute.make_layout((512, K // 128, M // 128))
-        return cute.make_tensor(SF.iterator, g_layout)
-
-    @cute.jit
     def __call__(
         self,
         gA: cute.Tensor,
@@ -42,14 +35,12 @@ class Sm120MatmulMXFP8:
         gC: cute.Tensor,
         stream: CUstream,
     ):
-        M, K = gA.shape
+        M, _ = gA.shape
         N, _ = gB.shape
         BM, BN, BK = self.cta_tile
 
         A_tma = self.prepare_AB(gA, BM, BK)
         B_tma = self.prepare_AB(gB, BN, BK)
-        gSFA = self.prepare_SF(gSFA, M, K)
-        gSFB = self.prepare_SF(gSFB, N, K)
 
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
@@ -74,7 +65,8 @@ class Sm120MatmulMXFP8:
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
 
-        _, K = A_tma.tma_tensor.shape
+        M, K = A_tma.tma_tensor.shape
+        N, _ = B_tma.tma_tensor.shape
         sA_layout = A_tma.smem_layout
         sB_layout = B_tma.smem_layout
 
@@ -109,8 +101,12 @@ class Sm120MatmulMXFP8:
             # select gmem tile
             gA_tiles = cute.local_tile(A_tma.tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
             gB_tiles = cute.local_tile(B_tma.tma_tensor, (BN, BK), (bid_n, None))
-            gSFA_tiles = gSFA[None, None, bid_m]
-            gSFB_tiles = gSFB[None, None, bid_n]
+
+            SF_size = Int32(32 * 4 * 4)
+            gSFA_ = cute.make_tensor(gSFA.iterator, cute.make_layout((SF_size, K // BK, M // BM)))
+            gSFB_ = cute.make_tensor(gSFB.iterator, cute.make_layout((SF_size, K // BK, N // BN)))
+            gSFA_tiles = gSFA_[None, None, bid_m]
+            gSFB_tiles = gSFB_[None, None, bid_n]
 
             for iter_k in range(K // BK):
                 mbar = tma_full_mbar + tma_stage
@@ -125,8 +121,8 @@ class Sm120MatmulMXFP8:
 
                 # cpasync.CopyBulkG2SOp() generates mapa + cp.async.bulk.shared::cluster.global,
                 # which is unnecessary.
-                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, iter_k], Int32(512), mbar)
-                tma_g2s(sSFB[None, tma_stage], gSFB_tiles[None, iter_k], Int32(512), mbar)
+                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, iter_k], SF_size, mbar)
+                tma_g2s(sSFB[None, tma_stage], gSFB_tiles[None, iter_k], SF_size, mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:
@@ -214,6 +210,7 @@ class Sm120MatmulMXFP8:
                                 Int16(n % 4),
                             )
 
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                 tma_stage = (tma_stage + 1) % num_stages

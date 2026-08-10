@@ -163,6 +163,12 @@ class Sm120Matmul:
                         for n in cutlass.range_constexpr(WN // 8):
                             rC[None, n, m] = mma_sync(rA[None, m, k], rB[(None, n % 2), n // 2, k], rC[None, n, m])
 
+                # mbarrier.arrive seems NOT to observe the completion of ldmatrix,
+                # even when it's issued immediately after LDSM in SASS.
+                # this is most clearly observed when we run mma.sync with INT8,
+                # which should guarantee bit-identical results.
+                # adding bar.sync to force the completion of ldmatrix.
+                cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                 tma_stage = (tma_stage + 1) % num_stages

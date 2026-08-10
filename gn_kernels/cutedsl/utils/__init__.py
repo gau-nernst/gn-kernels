@@ -161,10 +161,8 @@ def mma_sync_nvfp4(
     b: cute.Tensor,
     c: cute.Tensor,
     SFA: Int32,
-    byte_id_A: Int16,
     thread_id_A: Int16,
     SFB: Int32,
-    byte_id_B: Int16,
     thread_id_B: Int16,
     *,
     loc=None,
@@ -172,6 +170,7 @@ def mma_sync_nvfp4(
 ):
     a = cute.recast_tensor(a, Int32, loc=loc, ip=ip)
     b = cute.recast_tensor(b, Int32, loc=loc, ip=ip)
+    byte_id = Int16(0)  # must be zero
 
     mlir_ty = cutlass.Float32.mlir_type
     out = llvm.inline_asm(
@@ -179,8 +178,8 @@ def mma_sync_nvfp4(
         [a[i].ir_value(loc=loc, ip=ip) for i in range(4)]
         + [b[i].ir_value(loc=loc, ip=ip) for i in range(2)]
         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)]
-        + [SFA.ir_value(loc=loc, ip=ip), byte_id_A.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
-        + [SFB.ir_value(loc=loc, ip=ip), byte_id_B.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
+        + [SFA.ir_value(loc=loc, ip=ip), byte_id.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
+        + [SFB.ir_value(loc=loc, ip=ip), byte_id.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
         "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
         "{$0, $1, $2, $3}, "
         "{$4, $5, $6, $7}, "
