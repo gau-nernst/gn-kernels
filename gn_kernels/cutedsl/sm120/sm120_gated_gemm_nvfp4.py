@@ -13,25 +13,26 @@ from ..utils import mma_sync_nvfp4, permute, simple_tma_g2s, tma_g2s
 
 
 class Sm120GatedGemmNVFP4:
-    cta_tile = (128, 64, 256)
-    warp_layout = (2, 2)
+    # the current code supports the following
+    # - BM: 128 (fixed)
+    # - BN: 64 or 128
+    # - BK: 256 or 128 (128B or 64B)
+    # - WN: >=32
+
+    cta_tile = (128, 128, 128)
+    warp_layout = (2, 4)
     num_stages = 2
 
     @cute.jit
     def prepare_tma(
         self, gX: cute.Tensor, BM: cutlass.Constexpr[int], BK: cutlass.Constexpr[int], tma_op: cpasync.TmaCopyOp
     ):
-        swizzle = cute.make_swizzle(3, 4, 3)
+        assert BK <= 256
+        # <3,4,3> for 128B, <2,4,3> for 64B
+        swizzle = cute.make_swizzle(int(math.log2(BK // 32)), 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
         s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
         return cpasync.make_tiled_tma_atom(tma_op, gX, s_layout, (BM, BK))
-
-    @cute.jit
-    def prepare_SF(self, SF: cute.Tensor, M: Int32, K: Int32):
-        # NVIDIA SF layout in gmem
-        # if SF has shape [M, Ksf], it's permuted as [M/128, Ksf/4, 32, 4, 4]
-        g_layout = cute.make_layout((2048, K // 256, M // 128))
-        return cute.make_tensor(SF.iterator, g_layout)
 
     @cute.jit
     def __call__(
@@ -48,7 +49,7 @@ class Sm120GatedGemmNVFP4:
         gC: cute.Tensor,
         stream: CUstream,
     ):
-        M, K = gX.shape
+        M, _ = gX.shape
         N, _ = gW1.shape
         BM, BN, BK = self.cta_tile
 
@@ -59,13 +60,13 @@ class Sm120GatedGemmNVFP4:
         block = (num_warps * 32, 1, 1)
         self.kernel(
             self.prepare_tma(gX, BM, BK, tma_op),
-            self.prepare_SF(gSFX, M, K),
+            gSFX,
             gSFX_tensor,
             self.prepare_tma(gW1, BN, BK, tma_op),
-            self.prepare_SF(gSFW1, N, K),
+            gSFW1,
             gSFW1_tensor,
             self.prepare_tma(gW3, BN, BK, tma_op),
-            self.prepare_SF(gSFW3, N, K),
+            gSFW3,
             gSFW3_tensor,
             gC,
         ).launch(grid=grid, block=block, stream=stream)
@@ -92,8 +93,11 @@ class Sm120GatedGemmNVFP4:
         BM, BN, BK = self.cta_tile
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
+        MMA_K = 64  # 32B
+        NUM_MMA_THREADS = math.prod(self.warp_layout) * 32
 
-        _, K = X_tma.tma_tensor.shape
+        M, K = X_tma.tma_tensor.shape
+        N, K = W1_tma.tma_tensor.shape
 
         # allocate smem
         def allocate_tensor(smem, layout):
@@ -104,7 +108,7 @@ class Sm120GatedGemmNVFP4:
         sW1 = allocate_tensor(smem, W1_tma.smem_layout)
         sW3 = allocate_tensor(smem, W3_tma.smem_layout)
 
-        sf_slayout = cute.make_layout(((4, 4, 32, 4), num_stages))
+        sf_slayout = cute.make_layout(((4, 4, 32, BK // MMA_K), num_stages))
         sSFX = smem.allocate_tensor(Float8E4M3FN, sf_slayout, byte_alignment=128)
         sSFW1 = smem.allocate_tensor(Float8E4M3FN, sf_slayout, byte_alignment=128)
         sSFW3 = smem.allocate_tensor(Float8E4M3FN, sf_slayout, byte_alignment=128)
@@ -116,7 +120,7 @@ class Sm120GatedGemmNVFP4:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(num_stages):
                     cute.arch.mbarrier_init(tma_full_mbar + i, 1)
-                    cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
+                    cute.arch.mbarrier_init(tma_empty_mbar + i, NUM_MMA_THREADS)
                 cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
             cpasync.prefetch_descriptor(X_tma.atom)
@@ -124,7 +128,7 @@ class Sm120GatedGemmNVFP4:
             cpasync.prefetch_descriptor(W3_tma.atom)
         cute.arch.sync_threads()
 
-        if warp_id == 4:
+        if warp_id == math.prod(self.warp_layout):
             # TMA warp
             tma_stage = 0
             parity = 1
@@ -134,13 +138,21 @@ class Sm120GatedGemmNVFP4:
             gW1_tiles = cute.local_tile(W1_tma.tma_tensor, (BN, BK), (bid_n, None))  # [BN, BK, K/BK]
             gW3_tiles = cute.local_tile(W3_tma.tma_tensor, (BN, BK), (bid_n, None))  # [BN, BK, K/BK]
 
+            SF_SIZE = Int32(32 * 4 * 4 * (BK // MMA_K))
+            gSFX_ = cute.make_tensor(gSFX.iterator, cute.make_layout((SF_SIZE, K // BK, M // 128)))
+            gSFW1_ = cute.make_tensor(gSFW1.iterator, cute.make_layout((SF_SIZE, K // BK, N // 128)))
+            gSFW3_ = cute.make_tensor(gSFW3.iterator, cute.make_layout((SF_SIZE, K // BK, N // 128)))
+            gSFX_tiles = gSFX_[None, None, bid_m]
+            gSFW1_tiles = gSFW1_[None, None, bid_n * BN // 128]
+            gSFW3_tiles = gSFW3_[None, None, bid_n * BN // 128]
+
             for iter_k in range(K // BK):
                 mbar = tma_full_mbar + tma_stage
 
                 cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
 
                 with cute.arch.elect_one():
-                    STAGE_SIZE = (BM + BN * 2) * (BK // 2) + (BM + BN * 4) * (BK // 16)
+                    STAGE_SIZE = (BM + BN * 2) * (BK // 2) + SF_SIZE * 3
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
                 simple_tma_g2s(X_tma.atom, gX_tiles[None, None, iter_k], sX[None, None, tma_stage], mbar)
                 simple_tma_g2s(W1_tma.atom, gW1_tiles[None, None, iter_k], sW1[None, None, tma_stage], mbar)
@@ -148,9 +160,9 @@ class Sm120GatedGemmNVFP4:
 
                 # cpasync.CopyBulkG2SOp() generates mapa + cp.async.bulk.shared::cluster.global,
                 # which is unnecessary.
-                tma_g2s(sSFX[None, tma_stage], gSFX[None, iter_k, bid_m], Int32(2048), mbar)
-                tma_g2s(sSFW1[None, tma_stage], gSFW1[None, iter_k, bid_n // 2], Int32(2048), mbar)
-                tma_g2s(sSFW3[None, tma_stage], gSFW3[None, iter_k, bid_n // 2], Int32(2048), mbar)
+                tma_g2s(sSFX[None, tma_stage], gSFX_tiles[None, iter_k], SF_SIZE, mbar)
+                tma_g2s(sSFW1[None, tma_stage], gSFW1_tiles[None, iter_k], SF_SIZE, mbar)
+                tma_g2s(sSFW3[None, tma_stage], gSFW3_tiles[None, iter_k], SF_SIZE, mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:
@@ -165,6 +177,7 @@ class Sm120GatedGemmNVFP4:
             WN = BN // num_warp_n
             warp_id_m = warp_id // num_warp_n
             warp_id_n = warp_id % num_warp_n
+            assert WN >= 32
 
             # warp partition
             # shape: (WM, BK, num_stages)
@@ -200,15 +213,20 @@ class Sm120GatedGemmNVFP4:
 
             # shape: Int32 (2, 4, num_stages)
             sSFX_view = cute.local_tile(sSFX_view, (2, 4, num_stages), (warp_id_m, 0, 0))
-            sSFW1_view = cute.local_tile(sSFW1_view, (1, 4, num_stages), ((bid_n % 2) * 2 + warp_id_n, 0, 0))
-            sSFW3_view = cute.local_tile(sSFW3_view, (1, 4, num_stages), ((bid_n % 2) * 2 + warp_id_n, 0, 0))
+
+            # select the correct half
+            if cutlass.const_expr(BN == 64):
+                sSFW1_view = cute.local_tile(sSFW1_view, (2, 4, num_stages), (bid_n % 2, 0, 0))
+                sSFW3_view = cute.local_tile(sSFW3_view, (2, 4, num_stages), (bid_n % 2, 0, 0))
+
+            sSFW1_view = cute.local_tile(sSFW1_view, (WN // 32, 4, num_stages), (warp_id_n, 0, 0))
+            sSFW3_view = cute.local_tile(sSFW3_view, (WN // 32, 4, num_stages), (warp_id_n, 0, 0))
 
             sfx_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=64)
-            sfw_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=32)
+            sfw_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=32 * (WN // 32))
 
             # registers
             # let ptxas decides register reuse for rA and rB
-            MMA_K = 64  # 32B
             rX = cute.make_rmem_tensor((32, WM // 16, BK // MMA_K), Float4E2M1FN)
             rW1 = cute.make_rmem_tensor(((16, 2), WN // 16, BK // MMA_K), Float4E2M1FN)
             rW3 = cute.make_rmem_tensor(((16, 2), WN // 16, BK // MMA_K), Float4E2M1FN)
@@ -218,13 +236,13 @@ class Sm120GatedGemmNVFP4:
             rO3.fill(0.0)
 
             rSFX = cute.make_rmem_tensor((2, BK // MMA_K), Int32)
-            rSFW1 = cute.make_rmem_tensor((1, BK // MMA_K), Int32)
-            rSFW3 = cute.make_rmem_tensor((1, BK // MMA_K), Int32)
+            rSFW1 = cute.make_rmem_tensor((WN // 32, BK // MMA_K), Int32)
+            rSFW3 = cute.make_rmem_tensor((WN // 32, BK // MMA_K), Int32)
 
             for iter_k in range(K // BK):
                 if warp_id == 0:
                     cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, parity)
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
 
                 for k in cutlass.range_constexpr(BK // MMA_K):
                     # TODO: check bank conflicts
@@ -257,7 +275,7 @@ class Sm120GatedGemmNVFP4:
                                 Int16(n % 4),
                             )
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                 tma_stage = (tma_stage + 1) % num_stages
@@ -282,6 +300,25 @@ class Sm120GatedGemmNVFP4:
             X_scale = gSFX_tensor[0]
             W1_scale = gSFW1_tensor[0] * X_scale
             W3_scale = gSFW3_tensor[0] * X_scale
+
+            # for m in cutlass.range_constexpr(WM // 16):
+            #     rAmax = cute.make_rmem_tensor((2, WN // 16), Float32)
+            #     rAmax.fill(0)
+
+            #     for n in cutlass.range_constexpr(WN // 8):
+            #         for i in cutlass.range_constexpr(4):
+            #             o1 = rO1[i, n, m] * W1_scale
+            #             o3 = rO3[i, n, m] * W3_scale
+            #             sigmoid = cute.arch.rcp_approx(1.0 + cute.exp(-o1))
+            #             rO1[i, n, m] = o1 * o3 * sigmoid
+
+            #             rAmax[i // 2, n // 2] = cute.arch.fmax(rAmax[i // 2, n // 2], cute.abs(rO1[i, n, m]))
+
+            #     # 4 threads
+            #     for n in cutlass.range_constexpr(WN // 16):
+            #         for i in cutlass.range_constexpr(2):
+            #             rAmax[0, n] = cute.arch.fmax(rAmax[0, n, m], cute.arch.shuffle_sync_bfly(rAmax[0, n], 1 << i))
+            #             rAmax[1, n] = cute.arch.fmax(rAmax[1, n, m], cute.arch.shuffle_sync_bfly(rAmax[1, n], 1 << i))
 
             # explicit for loop to interleave cvt with st.global
             for m in cutlass.range_constexpr(WM // 16):
