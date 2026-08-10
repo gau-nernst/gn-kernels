@@ -13,24 +13,19 @@ from ..utils import mma_sync_nvfp4, permute, simple_tma_g2s, tma_g2s
 
 
 class Sm120MatmulNVFP4:
-    cta_tile = (128, 128, 256)
+    cta_tile = (128, 128, 128)
     warp_layout = (2, 2)
     num_stages = 2
 
     @cute.jit
-    def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
-        tma_op = cpasync.CopyBulkTensorTileG2SOp()
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
+    def prepare_tma(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
+        assert BK <= 256
+        # <3,4,3> for 128B, <2,4,3> for 64B
+        swizzle = cute.make_swizzle(int(math.log2(BK // 32)), 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
-        s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
+        s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
+        tma_op = cpasync.CopyBulkTensorTileG2SOp()
         return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
-
-    @cute.jit
-    def prepare_SF(self, SF: cute.Tensor, M: Int32, K: Int32):
-        # NVIDIA SF layout in gmem
-        # if SF has shape [M, Ksf], it's permuted as [M/128, Ksf/4, 32, 4, 4]
-        g_layout = cute.make_layout((2048, K // 256, M // 128))
-        return cute.make_tensor(SF.iterator, g_layout)
 
     @cute.jit
     def __call__(
@@ -40,22 +35,19 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
-        alpha: Float32,
         stream: CUstream,
     ):
-        M, K = gA.shape
+        M, _ = gA.shape
         N, _ = gB.shape
         BM, BN, BK = self.cta_tile
 
-        A_tma = self.prepare_AB(gA, BM, BK)
-        B_tma = self.prepare_AB(gB, BN, BK)
-        gSFA = self.prepare_SF(gSFA, M, K)
-        gSFB = self.prepare_SF(gSFB, N, K)
+        A_tma = self.prepare_tma(gA, BM, BK)
+        B_tma = self.prepare_tma(gB, BN, BK)
 
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
-        self.kernel(A_tma, B_tma, gSFA, gSFB, gC, alpha).launch(grid=grid, block=block, stream=stream)
+        self.kernel(A_tma, B_tma, gSFA, gSFB, gC).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def kernel(
@@ -65,7 +57,6 @@ class Sm120MatmulNVFP4:
         gSFA: cute.Tensor,
         gSFB: cute.Tensor,
         gC: cute.Tensor,
-        alpha: Float32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         bid_m, bid_n, _ = cute.arch.block_idx()
@@ -75,8 +66,10 @@ class Sm120MatmulNVFP4:
         BM, BN, BK = self.cta_tile
         num_warp_m, num_warp_n = self.warp_layout
         num_stages = self.num_stages
+        MMA_K = 64  # 32B
 
-        _, K = A_tma.tma_tensor.shape
+        M, K = A_tma.tma_tensor.shape
+        N, _ = B_tma.tma_tensor.shape
         sA_layout = A_tma.smem_layout
         sB_layout = B_tma.smem_layout
 
@@ -85,7 +78,7 @@ class Sm120MatmulNVFP4:
         sA = smem.allocate_tensor(Float4E2M1FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(Float4E2M1FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
 
-        sf_slayout = cute.make_layout(((4, 4, 32, 4), num_stages))
+        sf_slayout = cute.make_layout(((4, 4, 32, BK // MMA_K), num_stages))
         sSFA = smem.allocate_tensor(Float8E4M3FN, sf_slayout, byte_alignment=128)
         sSFB = smem.allocate_tensor(Float8E4M3FN, sf_slayout, byte_alignment=128)
 
@@ -111,8 +104,12 @@ class Sm120MatmulNVFP4:
             # select gmem tile
             gA_tiles = cute.local_tile(A_tma.tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
             gB_tiles = cute.local_tile(B_tma.tma_tensor, (BN, BK), (bid_n, None))
-            gSFA_tiles = gSFA[None, None, bid_m]
-            gSFB_tiles = gSFB[None, None, bid_n]
+
+            SF_SIZE = Int32(32 * 4 * 4 * (BK // MMA_K))
+            gSFA_ = cute.make_tensor(gSFA.iterator, cute.make_layout((SF_SIZE, K // BK, M // BM)))
+            gSFB_ = cute.make_tensor(gSFB.iterator, cute.make_layout((SF_SIZE, K // BK, N // BN)))
+            gSFA_tiles = gSFA_[None, None, bid_m]
+            gSFB_tiles = gSFB_[None, None, bid_n]
 
             for iter_k in range(K // BK):
                 mbar = tma_full_mbar + tma_stage
@@ -127,8 +124,8 @@ class Sm120MatmulNVFP4:
 
                 # cpasync.CopyBulkG2SOp() generates mapa + cp.async.bulk.shared::cluster.global,
                 # which is unnecessary.
-                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, iter_k], Int32(2048), mbar)
-                tma_g2s(sSFB[None, tma_stage], gSFB_tiles[None, iter_k], Int32(2048), mbar)
+                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, iter_k], SF_SIZE, mbar)
+                tma_g2s(sSFB[None, tma_stage], gSFB_tiles[None, iter_k], SF_SIZE, mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:
@@ -180,7 +177,6 @@ class Sm120MatmulNVFP4:
 
             # registers
             # let ptxas decides register reuse for rA and rB
-            MMA_K = 64  # 32B
             rA = cute.make_rmem_tensor((32, WM // 16, BK // MMA_K), Float4E2M1FN)
             rB = cute.make_rmem_tensor(((16, 2), WN // 16, BK // MMA_K), Float4E2M1FN)
             rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
@@ -239,12 +235,8 @@ class Sm120MatmulNVFP4:
             # explicit for loop to interleave cvt with st.global
             for m in cutlass.range_constexpr(WM // 16):
                 for n in cutlass.range_constexpr(WN // 8):
-                    rC_f32 = cute.make_rmem_tensor((2, 2), Float32)
-                    for i in cutlass.range(4, vectorize=True):
-                        rC_f32[i] = rC[i, n, m] * alpha
-
                     rC_bf16 = cute.make_rmem_tensor((2, 2), BFloat16)
-                    rC_bf16.store(rC_f32.load().to(BFloat16))
+                    rC_bf16.store(rC[None, n, m].load().to(BFloat16))
                     cute.copy(cp_atom, rC_bf16, gC_view[None, None, (m, n)])
 
     @cache
@@ -262,10 +254,10 @@ class Sm120MatmulNVFP4:
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm120MatmulNVFP4()
-        return cute.compile(kernel, A, B, SFA, SFB, C, Float32(1.0), stream, options="--enable-tvm-ffi")
+        return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor, alpha: float = 1.0):
+def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C, alpha)
+    Sm120MatmulNVFP4.compile()(A, B, SFA.view(-1), SFB.view(-1), C)
     return C
