@@ -15,7 +15,8 @@ try:
 except ImportError:
     flash_attn = None
 
-from gn_kernels import attn_int8_qk, triton_attn
+from gn_kernels import triton_attn
+from gn_kernels.cutedsl.sm120 import sm120_attn_bf16
 
 
 # add a small offset so that output does not have a mean of zero,
@@ -81,8 +82,6 @@ def main(args: argparse.Namespace):
     if args.profile is not None:
         if args.profile == "triton_qk_int8":
             triton_attn(Q_i8, K_i8, V, scale_Q_i8, scale_Q_i8)
-        elif args.profile == "cuda_qk_int8":
-            attn_int8_qk(Q_i8, K_i8, V, scale_Q_i8, scale_Q_i8)
         return
 
     SOL_LOOKUP = {
@@ -123,13 +122,15 @@ def main(args: argparse.Namespace):
     if flash_attn is not None:
         bench(flash_attn.flash_attn_func, "flash-attn", Q, K, V, out_ref=bf16_ref)
 
+    if torch.cuda.get_device_capability() >= (9, 0):
+        bench(sm120_attn_bf16.attn, "CuteDSL sm120", Q, K, V, out_ref=bf16_ref)
+
     bench(triton_attn, "Triton", Q, K, V, out_ref=bf16_ref)
 
     Q_i8_dq = dequantize(Q_i8, scale_Q_i8.transpose(1, 2))
     K_i8_dq = dequantize(K_i8, scale_K_i8.transpose(1, 2))
     qk_i8_ref = sdpa(Q_i8_dq, K_i8_dq, V.float()).bfloat16()
     bench(triton_attn, "Triton qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, out_ref=qk_i8_ref)
-    bench(attn_int8_qk, "CUDA qk-int8", Q_i8, K_i8, V, scale_Q_i8, scale_K_i8, out_ref=qk_i8_ref)
 
     Q_f8_dq = dequantize(Q_f8, scale_Q_f8.transpose(1, 2))
     K_f8_dq = dequantize(K_f8, scale_K_f8.transpose(1, 2))

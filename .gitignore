@@ -5,3 +5,5 @@ __pycache__/
 *.hip
 uv.lock
 *.ptx
+*.cubin
+*.sass
