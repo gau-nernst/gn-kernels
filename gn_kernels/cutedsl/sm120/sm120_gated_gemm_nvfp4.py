@@ -532,7 +532,7 @@ def mm(
         # over-allocate C so i don't need to handle out-of-bounds writes lol
         pad_M = (M + 128 - 1) // 128 * 128
         C = X.new_empty(pad_M, N // 2, dtype=torch.float4_e2m1fn_x2)[:M]
-        SFC = X.new_empty(pad_M * (N // 16), dtype=torch.float8_e4m3fn)
+        SFC = X.new_empty(pad_M, (N // 16), dtype=torch.float8_e4m3fn)
         SFC_tensor = SFC_tensor.view(-1)
     else:
         C = X.new_empty(M, N, dtype=torch.bfloat16)
@@ -549,7 +549,7 @@ def mm(
         SFW3.view(-1),
         SFW3_tensor.view(-1),
         C,
-        SFC,
+        SFC.view(-1) if SFC is not None else None,
         SFC_tensor,
     )
-    return (C, SFC.view(M, N // 16)) if quantize_epilogue else C
+    return (C, SFC) if quantize_epilogue else C
