@@ -36,7 +36,15 @@ class Sm120Fp8_1d2d_Matmul:
 
     @cute.jit
     def __call__(
-        self, gA: cute.Tensor, gSFA: cute.Tensor, gB: cute.Tensor, gSFB: cute.Tensor, gC: cute.Tensor, stream: CUstream
+        self,
+        gA: cute.Tensor,
+        gSFA: cute.Tensor,
+        gB: cute.Tensor,
+        gSFB: cute.Tensor,
+        gBias: cute.Tensor | None,
+        gAdd: cute.Tensor | None,
+        gC: cute.Tensor,
+        stream: CUstream,
     ):
         BM, BN, BK = self.cta_tile
         A_tma = self.prepare_AB(gA, BM, BK)
@@ -46,11 +54,18 @@ class Sm120Fp8_1d2d_Matmul:
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
-        self.kernel(A_tma, gSFA, B_tma, gSFB, gC).launch(grid=grid, block=block, stream=stream)
+        self.kernel(A_tma, gSFA, B_tma, gSFB, gBias, gAdd, gC).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def kernel(
-        self, A_tma: cpasync.TmaInfo, gSFA: cute.Tensor, B_tma: cpasync.TmaInfo, gSFB: cute.Tensor, gC: cute.Tensor
+        self,
+        A_tma: cpasync.TmaInfo,
+        gSFA: cute.Tensor,
+        B_tma: cpasync.TmaInfo,
+        gSFB: cute.Tensor,
+        gBias: cute.Tensor | None,
+        gAdd: cute.Tensor | None,
+        gC: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
         bid_m, bid_n, _ = cute.arch.block_idx()
@@ -209,6 +224,35 @@ class Sm120Fp8_1d2d_Matmul:
                         rC2[3, n, m] += rC1[3, n, m] * rSFA[1, m]
 
             # epilogue
+            # TODO: TMA could have loaded these
+            if cutlass.const_expr(gAdd is not None):
+                for m in cutlass.range_constexpr(WM // 16):
+                    for n in cutlass.range_constexpr(WN // 8):
+                        off_m = bid_m * BM + warp_id_m * WM + m * 16 + (lane_id // 4)
+                        off_n = bid_n * BN + warp_id_n * WN + n * 8 + (lane_id % 4) * 2
+                        rC1[0, n, m] = gAdd[off_m + 0, off_n + 0]
+                        rC1[1, n, m] = gAdd[off_m + 0, off_n + 1]
+                        rC1[2, n, m] = gAdd[off_m + 8, off_n + 0]
+                        rC1[3, n, m] = gAdd[off_m + 8, off_n + 1]
+
+                for i in cutlass.range_constexpr(cute.size(rC2)):
+                    rC2[i] += rC1[i]
+
+            if cutlass.const_expr(gBias is not None):
+                rBias = cute.make_rmem_tensor((2, WN // 8), BFloat16)
+                for n in cutlass.range_constexpr(WN // 8):
+                    offset = bid_n * BN + warp_id_n * WN + n * 8 + (lane_id % 4) * 2
+                    rBias[0, n] = gBias[offset + 0]
+                    rBias[1, n] = gBias[offset + 1]
+
+                rBias_f32 = rBias.load().to(Float32)
+                for m in cutlass.range_constexpr(WM // 16):
+                    for n in cutlass.range_constexpr(WN // 8):
+                        rC2[0, n, m] += rBias_f32[0, n]
+                        rC2[1, n, m] += rBias_f32[1, n]
+                        rC2[2, n, m] += rBias_f32[0, n]
+                        rC2[3, n, m] += rBias_f32[1, n]
+
             cp_op = nvgpu.CopyUniversalOp()
             cp_atom = cute.make_copy_atom(cp_op, BFloat16, num_bits_per_copy=32)
 
@@ -234,6 +278,8 @@ class Sm120Fp8_1d2d_Matmul:
     @staticmethod
     def compile(
         SFB_dtype: torch.dtype,
+        has_bias: bool,
+        has_add: bool,
         cta_tile: tuple[int, int, int],
         warp_layout: tuple[int, int],
         num_stages: int,
@@ -250,13 +296,22 @@ class Sm120Fp8_1d2d_Matmul:
             TORCH_TO_CUTE_DTYPE[SFB_dtype], (N // 128, K // 128), (cute.sym_int64(), cute.sym_int64())
         )
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
+        bias = make_fake_tensor(BFloat16, (N,), (1,), assumed_align=16) if has_bias else None
+        add = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16) if has_add else None
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = Sm120Fp8_1d2d_Matmul(cta_tile, warp_layout, num_stages, use_mxfp8_mma)
-        return cute.compile(kernel, A, SFA, B, SFB, C, stream, options="--enable-tvm-ffi")
+        return cute.compile(kernel, A, SFA, B, SFB, bias, add, C, stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, SFA: torch.Tensor, B: torch.Tensor, SFB: torch.Tensor):
+def mm(
+    A: torch.Tensor,
+    SFA: torch.Tensor,
+    B: torch.Tensor,
+    SFB: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    add: torch.Tensor | None = None,
+):
     M = A.shape[0]
     N = B.shape[0]
 
@@ -269,6 +324,10 @@ def mm(A: torch.Tensor, SFA: torch.Tensor, B: torch.Tensor, SFB: torch.Tensor):
     BN = 128 if grid_m * (N // 128) >= 256 else 64
 
     C = A.new_empty(M, N, dtype=torch.bfloat16)
-    kernel = Sm120Fp8_1d2d_Matmul.compile(SFB.dtype, (BM, BN, BK), warp_layout, num_stages, use_mxfp8_mma)
-    kernel(A, SFA, B, SFB, C)
+    has_bias = bias is not None
+    has_add = add is not None
+    kernel = Sm120Fp8_1d2d_Matmul.compile(
+        SFB.dtype, has_bias, has_add, (BM, BN, BK), warp_layout, num_stages, use_mxfp8_mma
+    )
+    kernel(A, SFA, B, SFB, bias, add, C)
     return C
