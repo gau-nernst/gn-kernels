@@ -6,7 +6,6 @@ from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Int32, Int64, Uint16, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
-from cutlass.utils import get_smem_capacity_in_bytes
 
 from ..utils import mbarrier, simple_tma_g2s, to_cta0_smem
 from . import _tcgen05
@@ -19,7 +18,7 @@ class Sm100MatmulBF16:
         self.cta_tile = (BM, BN, BK)
         self.cta_group = cta_group
 
-        smem_bytes = get_smem_capacity_in_bytes()
+        smem_bytes = cutlass.memory.SmemAllocator.capacity_in_bytes()
         self.stage_size = (BM + (BN // cta_group)) * BK * 2
         self.num_stages = smem_bytes // self.stage_size
 
@@ -63,7 +62,7 @@ class Sm100MatmulBF16:
         sB_layout = B_tma.smem_layout
 
         # allocate smem
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sA = smem.allocate_tensor(BFloat16, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(BFloat16, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
 

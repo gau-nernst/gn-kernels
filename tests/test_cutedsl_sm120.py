@@ -1,27 +1,15 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from torch import Tensor
 
 from gn_kernels.cutedsl.sm120 import sm120_gated_gemm_nvfp4, sm120_mm, sm120_mm_mxfp8, sm120_mm_nvfp4
 from gn_kernels.quant_utils import quantize_mx, quantize_nvfp4_triton
+from gn_kernels.torch_mm import mxfp8_mm, nvfp4_mm
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
     reason="requires an SM120 GPU",
 )
-
-
-def mxfp8_mm(x: Tensor, x_sf: Tensor, w: Tensor, w_sf: Tensor):
-    scale = F.ScalingType.BlockWise1x32
-    swizzle = F.SwizzleType.SWIZZLE_32_4_4
-    return F.scaled_mm(x, w.T, x_sf, scale, w_sf, scale, swizzle, swizzle)
-
-
-def nvfp4_mm(x: Tensor, x_sf: Tensor, x_scale: Tensor, w: Tensor, w_sf: Tensor, w_scale: Tensor) -> Tensor:
-    recipe = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
-    swizzle = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
-    return F.scaled_mm(x, w.T, [x_sf, x_scale], recipe, [w_sf, w_scale], recipe, swizzle, swizzle)
 
 
 def test_mm_bf16():

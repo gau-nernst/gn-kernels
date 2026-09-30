@@ -115,7 +115,7 @@ def mma_mxfp8(
             Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
             _make_tmem_llvm_ptr(sfa_tmem, loc=loc, ip=ip),
             _make_tmem_llvm_ptr(sfb_tmem, loc=loc, ip=ip),
-            scale_vec_size=nvvm.Tcgen05MMAScaleVecSize.X1,  # BLOCK32 doesn't work
+            block_scale=nvvm.Tcgen05MMABlockScale.BLOCK32,
             loc=loc,
             ip=ip,
         )
@@ -146,7 +146,7 @@ def mma_nvfp4(
             Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
             _make_tmem_llvm_ptr(sfa_tmem, loc=loc, ip=ip),
             _make_tmem_llvm_ptr(sfb_tmem, loc=loc, ip=ip),
-            scale_vec_size=nvvm.Tcgen05MMAScaleVecSize.X4,
+            block_scale=nvvm.Tcgen05MMABlockScale.BLOCK16,
             loc=loc,
             ip=ip,
         )

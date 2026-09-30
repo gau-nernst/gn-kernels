@@ -13,7 +13,6 @@ from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor, make_ptr, nullptr
 from cutlass.cutlass_dsl import dsl_user_op
-from cutlass.utils import get_smem_capacity_in_bytes
 
 from ..utils import mbarrier, permute, simple_tma_g2s, to_cta0_smem
 from . import _tcgen05
@@ -68,7 +67,7 @@ class Sm100GemmRsBF16:
         self.cta_tile = (BM, BN, BK)
         self.cta_group = cta_group
 
-        smem_bytes = get_smem_capacity_in_bytes()
+        smem_bytes = cutlass.memory.SmemAllocator.capacity_in_bytes()
         self.stage_size = (BM + (BN // cta_group)) * BK * 2
         self.num_stages = smem_bytes // self.stage_size
 
@@ -143,7 +142,7 @@ class Sm100GemmRsBF16:
         cta_rank = raw_bid % self.cta_group
         num_tmem_stages = 512 // BN
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sA = smem.allocate_tensor(
             BFloat16,
             A_tma.smem_layout.outer,

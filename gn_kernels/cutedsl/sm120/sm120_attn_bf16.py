@@ -68,7 +68,7 @@ class Sm120Attn:
             return smem.allocate_tensor(BFloat16, s_layout.outer, byte_alignment=128, swizzle=s_layout.inner)
 
         # K and V share the same smem slots
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sK = allocate_smem(smem, K_tma.smem_layout)[0, None, 0, None, None]
         sV = cute.make_tensor(sK.iterator, V_tma.smem_layout.outer)[0, None, 0, None, None]
 

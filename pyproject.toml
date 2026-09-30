@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gn-kernels"
 version = "0.0.1"
 dependencies = [
-    "nvidia-cutlass-dsl[cu13]==4.7.0",
+    "nvidia-cutlass-dsl[cu13]==4.8.0",
     "apache-tvm-ffi",
 ]
 
@@ -25,4 +25,4 @@ extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 extend-select = ["I"]
-ignore = ["F401"]
+ignore = ["F401", "C408", "SIM115"]
