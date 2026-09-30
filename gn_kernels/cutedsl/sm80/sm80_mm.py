@@ -80,7 +80,7 @@ class Sm80Matmul:
         gB_tiles = cute.local_tile(gB, tiler=(BN, BK), coord=(bid_n, None))  # (BN, BK, K/BK)
 
         # allocate shared memory
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(dtype, sA_layout, 16)
         sB = smem.allocate_tensor(dtype, sB_layout, 16)
 

@@ -134,7 +134,7 @@ class Sm120GatedGemmNVFP4:
         def allocate_tensor(smem, layout):
             return smem.allocate_tensor(Float4E2M1FN, layout.outer, byte_alignment=128, swizzle=layout.inner)
 
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         sX = allocate_tensor(smem, X_tma.smem_layout)
         sW1 = allocate_tensor(smem, W1_tma.smem_layout)
         sW3 = allocate_tensor(smem, W3_tma.smem_layout)

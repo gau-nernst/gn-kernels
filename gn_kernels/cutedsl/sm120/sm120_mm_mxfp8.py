@@ -71,7 +71,7 @@ class Sm120MatmulMXFP8:
         sB_layout = B_tma.smem_layout
 
         # allocate smem
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
 
