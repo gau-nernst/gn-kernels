@@ -3,11 +3,11 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int16, Int32, Int64, cute
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..utils import mma_sync, mma_sync_mxfp8, permute, simple_tma_g2s
+from ..utils import mma_sync, mma_sync_fp8, permute, simple_tma_g2s
 
 
 class Sm120Attn:
@@ -72,7 +72,7 @@ class Sm120Attn:
             return smem.allocate_tensor(dtype, s_layout.outer, byte_alignment=128, swizzle=s_layout.inner)
 
         # K and V share the same smem slots
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         sK = allocate_smem(smem, Float8E4M3FN, K_tma.smem_layout)[0, None, 0, None, None]
         sV = allocate_smem(smem, BFloat16, V_tma.smem_layout)[0, None, 0, None, None]
 
@@ -208,23 +208,9 @@ class Sm120Attn:
                     cute.copy(ldsm_atom, sK_ldsm[None, (None, k, stage_id_k)], rK[None, None, k])
                     for m in cutlass.range_constexpr(WQ // 16):
                         for n in cutlass.range_constexpr(BK // 8):
-                            if cutlass.const_expr(self.use_mxfp8_mma):
-                                SF = Int32(127)
-                                byte_id = Int16(0)
-                                thread_id = Int16(0)
-                                rS[None, n, m] = mma_sync_mxfp8(
-                                    rQ[None, m, k],
-                                    rK[(None, n % 2), n // 2, k],
-                                    rS[None, n, m],
-                                    SF,
-                                    byte_id,
-                                    thread_id,
-                                    SF,
-                                    byte_id,
-                                    thread_id,
-                                )
-                            else:
-                                rS[None, n, m] = mma_sync(rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m])
+                            rS[None, n, m] = mma_sync_fp8(
+                                rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m], self.use_mxfp8_mma
+                            )
 
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_k_empty_mbar + stage_id_k)

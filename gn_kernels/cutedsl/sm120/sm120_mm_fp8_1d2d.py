@@ -4,12 +4,12 @@ from functools import cache
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int16, Int32, Int64, cute
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int64, cute
 from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync, mma_sync_mxfp8, permute, simple_tma_g2s
+from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync_fp8, permute, simple_tma_g2s
 
 
 class Sm120Fp8_1d2d_Matmul:
@@ -82,7 +82,7 @@ class Sm120Fp8_1d2d_Matmul:
         sB_layout = B_tma.smem_layout
 
         # allocate smem
-        smem = cutlass.memory.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
 
@@ -189,25 +189,9 @@ class Sm120Fp8_1d2d_Matmul:
 
                         for m in cutlass.range_constexpr(WM // 16):
                             for n in cutlass.range_constexpr(WN // 8):
-                                if cutlass.const_expr(self.use_mxfp8_mma):
-                                    SF = Int32(127)
-                                    byte_id = Int16(0)
-                                    thread_id = Int16(0)
-                                    rC1[None, n, m] = mma_sync_mxfp8(
-                                        rA[None, m, k],
-                                        rB[(None, n % 2), n // 2, k],
-                                        rC1[None, n, m],
-                                        SF,
-                                        byte_id,
-                                        thread_id,
-                                        SF,
-                                        byte_id,
-                                        thread_id,
-                                    )
-                                else:
-                                    rC1[None, n, m] = mma_sync(
-                                        rA[None, m, k], rB[(None, n % 2), n // 2, k], rC1[None, n, m]
-                                    )
+                                rC1[None, n, m] = mma_sync_fp8(
+                                    rA[None, m, k], rB[(None, n % 2), n // 2, k], rC1[None, n, m], self.use_mxfp8_mma
+                                )
 
                     cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)

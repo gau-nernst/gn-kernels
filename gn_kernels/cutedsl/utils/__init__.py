@@ -156,6 +156,17 @@ def mma_sync_mxfp8(
 
 
 @dsl_user_op
+def mma_sync_fp8(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, use_mxfp8: bool = False, *, loc=None, ip=None):
+    if cutlass.const_expr(use_mxfp8):
+        SF = Int32(127)
+        byte_id = Int16(0)
+        thread_id = Int16(0)
+        return mma_sync_mxfp8(a, b, c, SF, byte_id, thread_id, SF, byte_id, thread_id, loc=loc, ip=ip)
+    else:
+        return mma_sync(a, b, c, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def mma_sync_nvfp4(
     a: cute.Tensor,
     b: cute.Tensor,

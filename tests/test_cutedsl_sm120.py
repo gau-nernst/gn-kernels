@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from gn_kernels.cutedsl.sm120 import sm120_gated_gemm_nvfp4, sm120_mm, sm120_mm_mxfp8, sm120_mm_nvfp4
+from gn_kernels.cutedsl.sm120 import sm120_gated_gemm_nvfp4, sm120_mm, sm120_mm_fp8_1d2d, sm120_mm_mxfp8, sm120_mm_nvfp4
 from gn_kernels.quant_utils import quantize_mx, quantize_nvfp4_triton
 from gn_kernels.torch_mm import mxfp8_mm, nvfp4_mm
 
@@ -71,6 +71,23 @@ def test_mm_nvfp4():
     s = torch.ones(1, device="cuda")
     out = sm120_mm_nvfp4.mm(X, W, Xsf, Wsf)
     ref = nvfp4_mm(X, Xsf, s, W, Wsf, s)
+    torch.testing.assert_close(out, ref)
+
+
+def test_mm_fp8_1d2d():
+    M, N, K = 128, 256, 256
+
+    X = torch.randn(M, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
+    Xsf = torch.randn(K // 128, M, device="cuda").T
+    W = torch.randn(N, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
+    Wsf = torch.randn(N // 128, K // 128, device="cuda")
+
+    out = sm120_mm_fp8_1d2d.mm(X, Xsf, W, Wsf)
+
+    dX = (X.float().view(M, K // 128, 128) * Xsf.view(M, K // 128, 1)).view(M, K)
+    dW = (W.float().view(N // 128, 128, K // 128, 128) * Wsf.view(N // 128, 1, K // 128, 1)).view(N, K)
+    ref = (dX @ dW.T).bfloat16()
+
     torch.testing.assert_close(out, ref)
 
 
