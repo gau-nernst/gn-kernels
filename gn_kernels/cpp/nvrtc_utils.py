@@ -33,7 +33,7 @@ def cdiv(a: int, b: int) -> int:
 # not sure why we need to manually add CCCL include. new changes in CUDA 13?
 _include_dirs = (
     str(Path(CUDA_HOME) / "include" / "cccl"),
-    str(Path(__file__).parent / "csrc"),
+    str(Path(__file__).parent),
 )
 
 

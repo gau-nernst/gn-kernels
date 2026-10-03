@@ -4,14 +4,13 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from ..nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
+from .nvrtc_utils import _TYPE_MAP, _compile_kernel, cdiv
 
-CURRENT_DIR = Path(__file__).parent
-KERNEL = open(CURRENT_DIR / "kernel_sm80.cu").read()
+KERNEL = Path(__file__).with_suffix(".cu").read_text()
 
 
 @dataclasses.dataclass
-class AttnSm80Kernel:
+class Sm80AttnKernel:
     dtype: torch.dtype = torch.bfloat16
     qk_dim: int = 128
     v_dim: int = 128
