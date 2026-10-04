@@ -194,7 +194,7 @@ class Sm120AttnBF16:
                         for n in cutlass.range_constexpr(BK // 8):
                             rS[None, n, m] = mma_sync(rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m])
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
                 stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
@@ -268,7 +268,7 @@ class Sm120AttnBF16:
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
                 stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
@@ -325,9 +325,9 @@ class Sm120AttnQKFP8:
     num_k_stages: int = 2
     num_v_stages: int = 1
 
-    def __init__(self, num_heads: int, use_mxfp8_mma: bool):
+    def __init__(self, num_heads: int, use_mxfp8: bool):
         self.num_heads = num_heads
-        self.use_mxfp8_mma = use_mxfp8_mma
+        self.use_mxfp8 = use_mxfp8
 
     @cute.jit
     def __call__(self, gQ: cute.Tensor, gK: cute.Tensor, gV: cute.Tensor, gO: cute.Tensor, stream: CUstream):
@@ -498,10 +498,10 @@ class Sm120AttnQKFP8:
                     for m in cutlass.range_constexpr(WQ // 16):
                         for n in cutlass.range_constexpr(BK // 8):
                             rS[None, n, m] = mma_sync_fp8(
-                                rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m], self.use_mxfp8_mma
+                                rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m], self.use_mxfp8
                             )
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_k_empty_mbar + stage_id_k)
                 stage_id_k = (stage_id_k + 1) % num_k_stages
                 if stage_id_k == 0:
@@ -575,7 +575,7 @@ class Sm120AttnQKFP8:
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
                 cute.arch.mbarrier_arrive(tma_v_empty_mbar + stage_id_v)
                 stage_id_v = (stage_id_v + 1) % num_v_stages
                 if stage_id_v == 0:
@@ -607,7 +607,7 @@ class Sm120AttnQKFP8:
 
     @cache
     @staticmethod
-    def compile(num_heads: int, use_mxfp8_mma: bool):
+    def compile(num_heads: int, use_mxfp8: bool):
         B = cute.sym_int()
         Lq = cute.sym_int()
         Lk = cute.sym_int()
@@ -622,15 +622,15 @@ class Sm120AttnQKFP8:
         V = _make_tensor(Lk, BFloat16)
         O = _make_tensor(Lq, BFloat16)
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm120AttnQKFP8(num_heads, use_mxfp8_mma)
+        kernel = Sm120AttnQKFP8(num_heads, use_mxfp8)
         return cute.compile(kernel, Q, K, V, O, stream, options="--enable-tvm-ffi")
 
 
 def attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
     O = torch.empty_like(Q, dtype=torch.bfloat16)
     if Q.dtype == K.dtype == torch.float8_e4m3fn:
-        use_mxfp8_mma = "GeForce RTX 50" in torch.cuda.get_device_name()
-        kernel = Sm120AttnQKFP8.compile(Q.shape[2], use_mxfp8_mma)
+        use_mxfp8 = "GeForce RTX 50" in torch.cuda.get_device_name()
+        kernel = Sm120AttnQKFP8.compile(Q.shape[2], use_mxfp8)
     else:
         kernel = Sm120AttnBF16.compile(Q.shape[2])
     kernel(Q, K, V, O)
