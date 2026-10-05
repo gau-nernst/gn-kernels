@@ -174,14 +174,10 @@ class Sm100MatmulMXFP8:
 
                     with cute.arch.elect_one():
                         mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
-                    simple_tma_g2s(A_tma.tma_atom, gA_tiles[None, (bid_m, iter_k)], sA[None, None, tma_stage], mbar)
-                    simple_tma_g2s(B_tma.tma_atom, gB_tiles[None, (bid_n_, iter_k)], sB[None, None, tma_stage], mbar)
-                    simple_tma_g2s(
-                        SFA_tma.tma_atom, gSFA_tiles[None, (iter_k, bid_m)], sSFA[None, None, tma_stage], mbar
-                    )
-                    simple_tma_g2s(
-                        SFB_tma.tma_atom, gSFB_tiles[None, (iter_k, bid_n)], sSFB[None, None, tma_stage], mbar
-                    )
+                    simple_tma_g2s(A_tma.atom, gA_tiles[None, (bid_m, iter_k)], sA[None, None, tma_stage], mbar)
+                    simple_tma_g2s(B_tma.atom, gB_tiles[None, (bid_n_, iter_k)], sB[None, None, tma_stage], mbar)
+                    simple_tma_g2s(SFA_tma.atom, gSFA_tiles[None, (iter_k, bid_m)], sSFA[None, None, tma_stage], mbar)
+                    simple_tma_g2s(SFB_tma.atom, gSFB_tiles[None, (iter_k, bid_n)], sSFB[None, None, tma_stage], mbar)
 
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:
