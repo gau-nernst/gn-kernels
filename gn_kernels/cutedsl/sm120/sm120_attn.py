@@ -194,7 +194,7 @@ class Sm120AttnBF16:
                         for n in cutlass.range_constexpr(BK // 8):
                             rS[None, n, m] = mma_sync(rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m])
 
-                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
                 stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
@@ -268,7 +268,7 @@ class Sm120AttnBF16:
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
-                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar + stage_id)
                 stage_id = (stage_id + 1) % num_stages
                 if stage_id == 0:
@@ -501,7 +501,7 @@ class Sm120AttnQKFP8:
                                 rQ[None, m, k], rK[(None, n % 2), n // 2, k], rS[None, n, m], self.use_mxfp8
                             )
 
-                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_k_empty_mbar + stage_id_k)
                 stage_id_k = (stage_id_k + 1) % num_k_stages
                 if stage_id_k == 0:
@@ -575,7 +575,7 @@ class Sm120AttnQKFP8:
                         for n in cutlass.range_constexpr(DIM // 8):
                             rO[None, n, m] = mma_sync(rP[None, k, m], rV[(None, n % 2), k, n // 2], rO[None, n, m])
 
-                cute.arch.barrier(barrier_id=BAR_MMA, number_of_threads=128)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_v_empty_mbar + stage_id_v)
                 stage_id_v = (stage_id_v + 1) % num_v_stages
                 if stage_id_v == 0:

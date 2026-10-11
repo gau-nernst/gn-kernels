@@ -206,7 +206,7 @@ class Sm120Fp8_1d2d_Matmul:
                     rSFA[0, m] = sSFA[offset + 0, tma_stage]
                     rSFA[1, m] = sSFA[offset + 8, tma_stage]
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                 tma_stage = (tma_stage + 1) % num_stages
