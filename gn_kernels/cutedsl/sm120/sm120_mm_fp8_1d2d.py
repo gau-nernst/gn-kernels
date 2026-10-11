@@ -9,20 +9,18 @@ from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync_fp8, permute, simple_tma_g2s
+from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync_fp8, permute, simple_tma_g2s, tma_g2s
 
 
 class Sm120Fp8_1d2d_Matmul:
-    def __init__(
-        self, cta_tile: tuple[int, int, int], warp_layout: tuple[int, int], num_stages: int, use_mxfp8_mma: bool
-    ):
-        self.cta_tile = cta_tile
+    def __init__(self, BM: int, BN: int, warp_layout: tuple[int, int], num_stages: int, use_mxfp8_mma: bool) -> None:
+        self.cta_tile = (BM, BN, 128)
         self.warp_layout = warp_layout
         self.num_stages = num_stages
         self.use_mxfp8_mma = use_mxfp8_mma
 
     @cute.jit
-    def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
+    def prepare_AB(self, A: cute.Tensor, BM: int, BK: int):
         tma_op = cpasync.CopyBulkTensorTileG2SOp()
 
         # compute swizzle param
@@ -51,7 +49,7 @@ class Sm120Fp8_1d2d_Matmul:
         B_tma = self.prepare_AB(gB, BN, BK)
 
         M, N = gC.shape
-        grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
+        grid = (cute.ceil_div(M, BM) * cute.ceil_div(N, BN), 1, 1)
         num_warps = math.prod(self.warp_layout) + 1
         block = (num_warps * 32, 1, 1)
         self.kernel(A_tma, gSFA, B_tma, gSFB, gBias, gAdd, gC).launch(grid=grid, block=block, stream=stream)
@@ -68,7 +66,7 @@ class Sm120Fp8_1d2d_Matmul:
         gC: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        bid_m, bid_n, _ = cute.arch.block_idx()
+        bid, _, _ = cute.arch.block_idx()
         warp_id = cute.arch.make_warp_uniform(tid // 32)
         lane_id = tid % 32
 
@@ -77,14 +75,30 @@ class Sm120Fp8_1d2d_Matmul:
         num_stages = self.num_stages
         NUM_MMA_THREADS = num_warp_m * num_warp_n * 32
 
-        _, K = A_tma.tma_tensor.shape
+        M, K = A_tma.tma_tensor.shape
+        N, _ = B_tma.tma_tensor.shape
         sA_layout = A_tma.smem_layout
         sB_layout = B_tma.smem_layout
+
+        grid_m = cute.ceil_div(M, BM)
+        grid_n = cute.ceil_div(N, BN)
+        GROUP_M = 8
+        if cutlass.const_expr(GROUP_M == 1):
+            bid_n = bid % grid_n
+            bid_m = bid // grid_n
+        else:
+            group_size = GROUP_M * grid_n
+            group_id = bid // group_size
+            excess = bid % group_size
+            group_m = min(grid_m - group_id * GROUP_M, GROUP_M)
+            bid_m = group_id * GROUP_M + excess % group_m
+            bid_n = excess // group_m
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
         sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        sSFA = smem.allocate_tensor(Float32, cute.make_layout((BM, num_stages)), byte_alignment=128)
 
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
@@ -108,16 +122,21 @@ class Sm120Fp8_1d2d_Matmul:
             # select gmem tile
             gA_tiles = cute.local_tile(A_tma.tma_tensor, (BM, BK), (bid_m, None))  # [BM, BK, K/BK]
             gB_tiles = cute.local_tile(B_tma.tma_tensor, (BN, BK), (bid_n, None))
+            gSFA_tiles = cute.local_tile(gSFA, (BM, 1), (bid_m, None))  # [BM, 1, K/128]
+
+            # handle last partial tile + 16B alignment
+            sfa_cp_size = cutlass.Int32(min(cute.ceil_div(M, 4) * 4 - bid_m * BM, BM) * 4)
 
             for iter_k in range(K // BK):
                 mbar = tma_full_mbar + tma_stage
                 cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
 
                 with cute.arch.elect_one():
-                    STAGE_SIZE = (BM + BN) * BK
+                    STAGE_SIZE = (BM + BN) * BK + sfa_cp_size
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
                 simple_tma_g2s(A_tma.atom, gA_tiles[None, None, iter_k], sA[None, None, tma_stage], mbar)
                 simple_tma_g2s(B_tma.atom, gB_tiles[None, None, iter_k], sB[None, None, tma_stage], mbar)
+                tma_g2s(sSFA[None, tma_stage], gSFA_tiles[None, None, iter_k], sfa_cp_size, mbar)
 
                 tma_stage = (tma_stage + 1) % num_stages
                 if tma_stage == 0:
@@ -157,48 +176,45 @@ class Sm120Fp8_1d2d_Matmul:
             MMA_K = 32
             rA = cute.make_rmem_tensor((16, WM // 16, BK // MMA_K), Float8E4M3FN)
             rB = cute.make_rmem_tensor(((8, 2), WN // 16, BK // MMA_K), Float8E4M3FN)
+            rSFA = cute.make_rmem_tensor((2, WM // 16), Float32)
             rC1 = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
             rC2 = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
             rC2.fill(0.0)
 
             gSFB_view = gSFB[bid_n * BN // 128, None]  # [K/128]
 
-            for iter_k1 in range(K // 128):
+            for iter_k in range(K // BK):
                 rC1.fill(0.0)
+                sfb = gSFB_view[iter_k].to(Float32)
 
-                sfb = gSFB_view[iter_k1].to(Float32)
-                rSFA = cute.make_rmem_tensor((2, WM // 16), Float32)
+                if warp_id == 0:
+                    cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, parity)
+                cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
+
+                for k in cutlass.range_constexpr(BK // MMA_K):
+                    cute.copy(ldsm_atom, sA_ldsm[None, (None, k, tma_stage)], rA[None, None, k])
+                    cute.copy(ldsm_atom, sB_ldsm[None, (None, k, tma_stage)], rB[None, None, k])
+
+                    for m in cutlass.range_constexpr(WM // 16):
+                        for n in cutlass.range_constexpr(WN // 8):
+                            rC1[None, n, m] = mma_sync_fp8(
+                                rA[None, m, k], rB[(None, n % 2), n // 2, k], rC1[None, n, m], self.use_mxfp8_mma
+                            )
+
                 for m in cutlass.range_constexpr(WM // 16):
-                    offset = bid_m * BM + warp_id_m * WM + m * 16 + (lane_id // 4)
-                    rSFA[0, m] = gSFA[offset + 0, iter_k1]
-                    rSFA[1, m] = gSFA[offset + 8, iter_k1]
+                    offset = warp_id_m * WM + m * 16 + (lane_id // 4)
+                    rSFA[0, m] = sSFA[offset + 0, tma_stage]
+                    rSFA[1, m] = sSFA[offset + 8, tma_stage]
+
+                cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
+                cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
+
+                tma_stage = (tma_stage + 1) % num_stages
+                if tma_stage == 0:
+                    parity ^= 1
 
                 for i in cutlass.range_constexpr(cute.size(rSFA)):
                     rSFA[i] *= sfb
-
-                for iter_k2 in cutlass.range_constexpr(128 // BK):
-                    iter_k = iter_k1 * (128 // BK) + iter_k2
-
-                    if warp_id == 0:
-                        cute.arch.mbarrier_wait(tma_full_mbar + tma_stage, parity)
-                    cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
-
-                    for k in cutlass.range_constexpr(BK // MMA_K):
-                        cute.copy(ldsm_atom, sA_ldsm[None, (None, k, tma_stage)], rA[None, None, k])
-                        cute.copy(ldsm_atom, sB_ldsm[None, (None, k, tma_stage)], rB[None, None, k])
-
-                        for m in cutlass.range_constexpr(WM // 16):
-                            for n in cutlass.range_constexpr(WN // 8):
-                                rC1[None, n, m] = mma_sync_fp8(
-                                    rA[None, m, k], rB[(None, n % 2), n // 2, k], rC1[None, n, m], self.use_mxfp8_mma
-                                )
-
-                    cute.arch.barrier(barrier_id=1, number_of_threads=NUM_MMA_THREADS)
-                    cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
-
-                    tma_stage = (tma_stage + 1) % num_stages
-                    if tma_stage == 0:
-                        parity ^= 1
 
                 for m in cutlass.range_constexpr(WM // 16):
                     for n in cutlass.range_constexpr(WN // 8):
@@ -209,6 +225,7 @@ class Sm120Fp8_1d2d_Matmul:
 
             # epilogue
             # TODO: TMA could have loaded these
+            # TODO: bounds check
             if cutlass.const_expr(gAdd is not None):
                 for m in cutlass.range_constexpr(WM // 16):
                     for n in cutlass.range_constexpr(WN // 8):
@@ -264,7 +281,8 @@ class Sm120Fp8_1d2d_Matmul:
         SFB_dtype: torch.dtype,
         has_bias: bool,
         has_add: bool,
-        cta_tile: tuple[int, int, int],
+        BM: int,
+        BN: int,
         warp_layout: tuple[int, int],
         num_stages: int,
         use_mxfp8_mma: bool,
@@ -284,7 +302,7 @@ class Sm120Fp8_1d2d_Matmul:
         add = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16) if has_add else None
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm120Fp8_1d2d_Matmul(cta_tile, warp_layout, num_stages, use_mxfp8_mma)
+        kernel = Sm120Fp8_1d2d_Matmul(BM, BN, warp_layout, num_stages, use_mxfp8_mma)
         return cute.compile(kernel, A, SFA, B, SFB, bias, add, C, stream, options="--enable-tvm-ffi")
 
 
@@ -296,22 +314,22 @@ def mm(
     bias: torch.Tensor | None = None,
     add: torch.Tensor | None = None,
 ):
-    M = A.shape[0]
+    M, K = A.shape
     N = B.shape[0]
 
-    BM, BK = 128, 128
+    BM = 128
     warp_layout = (4, 2)
     num_stages = 2
     use_mxfp8_mma = "GeForce RTX 50" in torch.cuda.get_device_name()
 
     grid_m = (M + BM - 1) // BM
     BN = 128 if grid_m * (N // 128) >= 256 else 64
+    assert K % 128 == 0 and N % BN == 0
 
-    C = A.new_empty(M, N, dtype=torch.bfloat16)
+    # over-allocate to avoid predicate stores
+    C = A.new_empty(grid_m * BM, N, dtype=torch.bfloat16)[:M]
     has_bias = bias is not None
     has_add = add is not None
-    kernel = Sm120Fp8_1d2d_Matmul.compile(
-        SFB.dtype, has_bias, has_add, (BM, BN, BK), warp_layout, num_stages, use_mxfp8_mma
-    )
+    kernel = Sm120Fp8_1d2d_Matmul.compile(SFB.dtype, has_bias, has_add, BM, BN, warp_layout, num_stages, use_mxfp8_mma)
     kernel(A, SFA, B, SFB, bias, add, C)
     return C

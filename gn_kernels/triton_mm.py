@@ -169,3 +169,116 @@ def triton_mm(
         A, B, C, bias, scale_A, scale_B, M, N, K, A.stride(), B.stride(), C.stride(), ACC_DTYPE=acc_dtype
     )
     return C
+
+
+@triton.jit(do_not_specialize=["M"])
+def _fp8_1d2d_mm_triton_kernel(
+    x_ptr,  # [M, K]
+    xs_ptr,  # [M, K/128]
+    w_ptr,  # [N, K]
+    ws_ptr,  # [N/128, K/128]
+    b_ptr,  # [N]
+    add_ptr,  # [M, N]
+    o_ptr,
+    M,
+    K: tl.constexpr,
+    stride_xm,
+    stride_xsm,
+    stride_xsk,
+    stride_wn,
+    stride_wsn,
+    stride_wsk,
+    stride_am,
+    stride_om,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
+):
+    tl.static_assert(128 % BLOCK_N == 0)
+    tl.static_assert(128 % BLOCK_K == 0)
+    tl.static_assert(K % BLOCK_K == 0)
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, tl.num_programs(1), tl.num_programs(0), 8)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < M
+
+    x_ptrs = x_ptr + offs_m * stride_xm + offs_k
+    w_ptrs = w_ptr + offs_n * stride_wn + offs_k[:, None]
+    xs_ptrs = xs_ptr + offs_m * stride_xsm
+    ws_ptrs = ws_ptr + (pid_n * BLOCK_N // 128) * stride_wsn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
+    if USE_DOT_SCALED:
+        sfx = tl.full((BLOCK_M, BLOCK_K // 32), 127, tl.uint8)
+        sfw = tl.full((BLOCK_N, BLOCK_K // 32), 127, tl.uint8)
+
+    for k in range(K // BLOCK_K):
+        x = tl.load(x_ptrs, mask_m)  # [BLOCK_M, BLOCK_K]
+        w = tl.load(w_ptrs)  # [BLOCK_K, BLOCK_N]
+        xs = tl.load(xs_ptrs + (k * BLOCK_K // 128) * stride_xsk, mask_m)  # [BLOCK_M, 1]
+        ws = tl.load(ws_ptrs + (k * BLOCK_K // 128) * stride_wsk)  # [BLOCK_N]
+
+        if USE_DOT_SCALED:
+            tmp = tl.dot_scaled(x, sfx, "e4m3", w, sfw, "e4m3")
+        else:
+            tmp = tl.dot(x, w)
+        acc += tmp * (xs.to(tl.float32) * ws.to(tl.float32))
+
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+
+    if add_ptr is not None:
+        acc += tl.load(add_ptr + offs_m * stride_am + offs_n, mask_m).to(tl.float32)
+
+    if b_ptr is not None:
+        acc += tl.load(b_ptr + offs_n).to(tl.float32)
+
+    o_ptrs = o_ptr + offs_m * stride_om + offs_n
+    tl.store(o_ptrs, acc, mask_m)
+
+
+def fp8_1d2d_mm_triton(
+    x: Tensor, xs: Tensor, w: Tensor, ws: Tensor, b: Tensor | None = None, add: Tensor | None = None
+):
+    M, K = x.shape
+    N, _ = w.shape
+    assert N % 128 == 0 and K % 128 == 0  # 128x128 weight scale blocks
+
+    out = x.new_empty(M, N, dtype=torch.bfloat16)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
+    USE_DOT_SCALED = "GeForce RTX 50" in torch.cuda.get_device_name()
+
+    grid = (N // BLOCK_N, triton.cdiv(M, BLOCK_M), 1)
+    _fp8_1d2d_mm_triton_kernel[grid](
+        x,
+        xs,
+        w,
+        ws,
+        b,
+        add,
+        out,
+        M,
+        K,
+        x.stride(0),
+        *xs.stride(),
+        w.stride(0),
+        *ws.stride(),
+        add.stride(0) if add is not None else 0,
+        out.stride(0),
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        USE_DOT_SCALED,
+        num_warps=8,
+    )
+    return out

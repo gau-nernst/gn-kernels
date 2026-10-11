@@ -250,3 +250,51 @@ def quantize_nvfp4_triton(x: Tensor, tensor_scale: Tensor, eps: float = 1e-12):
     quantize_nvfp4_triton_kernel[grid](x, tensor_scale, xq, scales, x.stride(0), x.stride(1), M, N, eps=eps)
 
     return xq.view(torch.float4_e2m1fn_x2), scales
+
+
+@triton.jit(do_not_specialize=["M"])
+def _quantize_fp8_1d_kernel(
+    x_ptr,
+    o_ptr,
+    os_ptr,
+    M,
+    stride_xm,
+    stride_xn,
+    stride_osm,
+    stride_osn,
+    stride_om,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # x and o: [M, N]
+    # os: [M, N/BLOCK_N]
+    pid_n = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    x = tl.load(x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask_m)  # [BLOCK_M, BLOCK_N]
+    amax = tl.max(tl.abs(x), axis=1, keep_dims=True)  # [BLOCK_M, 1]
+
+    scale = 448.0 * (1.0 / tl.maximum(amax.to(tl.float32), 1e-12))
+    inv_scale = 1.0 / scale
+    x_fp8 = x.to(tl.float32) * scale
+
+    tl.store(o_ptr + offs_m * stride_om + offs_n, x_fp8, mask_m)
+    tl.store(os_ptr + offs_m * stride_osm + pid_n * stride_osn, inv_scale, mask_m)
+
+
+def quantize_fp8_1d(x: Tensor):
+    M, N = x.shape
+    BLOCK_M = 1 if M < 8 else 4
+    BLOCK_N = 128
+    assert N % BLOCK_N == 0
+
+    out = x.new_empty(M, N, dtype=torch.float8_e4m3fn)
+    pad_M = triton.cdiv(M, 4) * 4  # 16B alignment. M-major
+    scale = x.new_empty(N // BLOCK_N, pad_M, dtype=torch.float32).T[:M]
+
+    grid = (N // BLOCK_N, triton.cdiv(M, BLOCK_M), 1)
+    _quantize_fp8_1d_kernel[grid](x, out, scale, M, *x.stride(), *scale.stride(), out.stride(0), BLOCK_M, BLOCK_N)
+    return out, scale
