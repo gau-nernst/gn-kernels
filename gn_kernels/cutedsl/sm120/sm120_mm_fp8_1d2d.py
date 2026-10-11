@@ -13,11 +13,11 @@ from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync_fp8, permute, simple_tma_g2s, 
 
 
 class Sm120Fp8_1d2d_Matmul:
-    def __init__(self, BM: int, BN: int, warp_layout: tuple[int, int], num_stages: int, use_mxfp8_mma: bool) -> None:
-        self.cta_tile = (BM, BN, 128)
-        self.warp_layout = warp_layout
-        self.num_stages = num_stages
-        self.use_mxfp8_mma = use_mxfp8_mma
+    def __init__(self) -> None:
+        self.cta_tile = (128, 128, 128)
+        self.warp_layout = (4, 2)
+        self.num_stages = 2
+        self.use_mxfp8_mma = "GeForce RTX 50" in torch.cuda.get_device_name()
 
     @cute.jit
     def prepare_AB(self, A: cute.Tensor, BM: int, BK: int):
@@ -277,16 +277,7 @@ class Sm120Fp8_1d2d_Matmul:
 
     @cache
     @staticmethod
-    def compile(
-        SFB_dtype: torch.dtype,
-        has_bias: bool,
-        has_add: bool,
-        BM: int,
-        BN: int,
-        warp_layout: tuple[int, int],
-        num_stages: int,
-        use_mxfp8_mma: bool,
-    ):
+    def compile(SFB_dtype: torch.dtype, has_bias: bool, has_add: bool):
         M = cute.sym_int()
         N = cute.sym_int()
         K = cute.sym_int()
@@ -302,7 +293,7 @@ class Sm120Fp8_1d2d_Matmul:
         add = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16) if has_add else None
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm120Fp8_1d2d_Matmul(BM, BN, warp_layout, num_stages, use_mxfp8_mma)
+        kernel = Sm120Fp8_1d2d_Matmul()
         return cute.compile(kernel, A, SFA, B, SFB, bias, add, C, stream, options="--enable-tvm-ffi")
 
 
@@ -317,19 +308,14 @@ def mm(
     M, K = A.shape
     N = B.shape[0]
 
-    BM = 128
-    warp_layout = (4, 2)
-    num_stages = 2
-    use_mxfp8_mma = "GeForce RTX 50" in torch.cuda.get_device_name()
-
+    BM, BN, BK = 128, 128, 128
     grid_m = (M + BM - 1) // BM
-    BN = 128 if grid_m * (N // 128) >= 256 else 64
-    assert K % 128 == 0 and N % BN == 0
+    assert K % BK == 0 and N % BN == 0
 
     # over-allocate to avoid predicate stores
     C = A.new_empty(grid_m * BM, N, dtype=torch.bfloat16)[:M]
     has_bias = bias is not None
     has_add = add is not None
-    kernel = Sm120Fp8_1d2d_Matmul.compile(SFB.dtype, has_bias, has_add, BM, BN, warp_layout, num_stages, use_mxfp8_mma)
+    kernel = Sm120Fp8_1d2d_Matmul.compile(SFB.dtype, has_bias, has_add)
     kernel(A, SFA, B, SFB, bias, add, C)
     return C
