@@ -78,14 +78,14 @@ def fp32_to_fp4e2m1x2(x: Tensor):
 
     # pack to 32-bit register
     f4_e2m1x2 = (
-        f4_e2m1[..., 1::8]
-        | (f4_e2m1[..., 0::8] << 4)
-        | (f4_e2m1[..., 3::8] << 8)
-        | (f4_e2m1[..., 2::8] << 12)
-        | (f4_e2m1[..., 5::8] << 16)
-        | (f4_e2m1[..., 4::8] << 20)
-        | (f4_e2m1[..., 7::8] << 24)
-        | (f4_e2m1[..., 6::8] << 28)
+        f4_e2m1[..., 0::8]
+        | (f4_e2m1[..., 1::8] << 4)
+        | (f4_e2m1[..., 2::8] << 8)
+        | (f4_e2m1[..., 3::8] << 12)
+        | (f4_e2m1[..., 4::8] << 16)
+        | (f4_e2m1[..., 5::8] << 20)
+        | (f4_e2m1[..., 6::8] << 24)
+        | (f4_e2m1[..., 7::8] << 28)
     )
     return f4_e2m1x2.view(torch.float4_e2m1fn_x2)
 
@@ -131,20 +131,8 @@ def dequantize_mx(xq: Tensor, scales: Tensor):
         )
 
         # unpack
-        xq_i32 = xq.view(torch.int32)
-        xq_unpacked = torch.stack(
-            [
-                xq_i32 & 0xF,
-                (xq_i32 >> 4) & 0xF,
-                (xq_i32 >> 8) & 0xF,
-                (xq_i32 >> 12) & 0xF,
-                (xq_i32 >> 16) & 0xF,
-                (xq_i32 >> 20) & 0xF,
-                (xq_i32 >> 24) & 0xF,
-                (xq_i32 >> 28) & 0xF,
-            ],
-            dim=-1,
-        )
+        xq_i32 = xq.view(torch.uint8).to(torch.int32)
+        xq_unpacked = torch.stack([xq_i32 & 0xF, (xq_i32 >> 4) & 0xF], dim=-1).flatten(-2)
         x = FP4E2M1_LUT[xq_unpacked]
 
         scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
@@ -213,10 +201,10 @@ def quantize_nvfp4_triton_kernel(
         asm="""
         {
         .reg .b8 byte0, byte1, byte2, byte3;
-        cvt.rn.satfinite.e2m1x2.f32 byte0, $1, $5;
-        cvt.rn.satfinite.e2m1x2.f32 byte1, $2, $6;
-        cvt.rn.satfinite.e2m1x2.f32 byte2, $3, $7;
-        cvt.rn.satfinite.e2m1x2.f32 byte3, $4, $8;
+        cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
+        cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
+        cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
+        cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
         mov.b32 $0, {byte0, byte1, byte2, byte3};
         }
         """,

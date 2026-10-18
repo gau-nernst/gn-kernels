@@ -2,8 +2,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from gn_kernels.cutedsl.sm120 import sm120_gated_gemm_nvfp4, sm120_mm, sm120_mm_fp8_1d2d, sm120_mm_mxfp8, sm120_mm_nvfp4
-from gn_kernels.quant_utils import quantize_mx, quantize_nvfp4_triton
+from gn_kernels.cutedsl.sm120 import (
+    sm120_gated_gemm_nvfp4,
+    sm120_mm,
+    sm120_mm_fp8_1d2d,
+    sm120_mm_mxf8f6f4,
+    sm120_mm_nvfp4,
+)
+from gn_kernels.quant_utils import dequantize_mx, permute_nv_sf, quantize_mx, quantize_nvfp4_triton
 from gn_kernels.torch_mm import mxfp8_mm, nvfp4_mm
 
 pytestmark = pytest.mark.skipif(
@@ -43,17 +49,19 @@ def test_mm_fp8():
     torch.testing.assert_close(out, ref)
 
 
-def test_mm_mxfp8():
+@pytest.mark.parametrize("a_dtype", ["e4m3", "e2m1"])
+@pytest.mark.parametrize("b_dtype", ["e4m3", "e2m1"])
+def test_mm_mxf8f6f4(a_dtype: torch.dtype, b_dtype: torch.dtype):
     M, N, K = 128, 256, 256
 
-    def make_input(*shape):
-        x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * (K**-0.5)
-        return quantize_mx(x, torch.float8_e4m3fn)
+    def make_input(M: int, N: int, dtype: torch.dtype):
+        x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * (K**-0.5)
+        return quantize_mx(x, dict(e4m3=torch.float8_e4m3fn, e2m1=torch.float4_e2m1fn_x2)[dtype])
 
-    X, Xsf = make_input(M, K)
-    W, Wsf = make_input(N, K)
-    out = sm120_mm_mxfp8.mm(X, W, Xsf, Wsf)
-    ref = mxfp8_mm(X, Xsf, W, Wsf)
+    X, Xsf = make_input(M, K, a_dtype)
+    W, Wsf = make_input(N, K, b_dtype)
+    out = sm120_mm_mxf8f6f4.mm(X, W, permute_nv_sf(Xsf), permute_nv_sf(Wsf))
+    ref = (dequantize_mx(X, Xsf) @ dequantize_mx(W, Wsf).T).to(torch.bfloat16)
     torch.testing.assert_close(out, ref)
 
 

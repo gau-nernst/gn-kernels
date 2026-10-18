@@ -18,7 +18,7 @@ class Sm120MatmulNVFP4:
     num_stages = 2
 
     @cute.jit
-    def prepare_tma(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
+    def prepare_tma(self, A: cute.Tensor, BM: int, BK: int):
         assert BK <= 256
         # <3,4,3> for 128B, <2,4,3> for 64B
         swizzle = cute.make_swizzle(int(math.log2(BK // 32)), 4, 3)

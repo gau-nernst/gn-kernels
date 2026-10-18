@@ -1,29 +1,48 @@
 import math
 from functools import cache
+from typing import Literal
 
 import cutlass
 import torch
 from cuda.bindings.driver import CUstream
-from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Float32, Int16, Int32, Int64, cute
+from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Float32, Int16, Int32, Int64, Uint8, cute
 from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_tensor
 
-from ..utils import mma_sync_mxfp8, permute, simple_tma_g2s, tma_g2s
+from ..utils import (
+    CUTE_TO_PTX_DTYPE,
+    PTX_TO_CUTE_DTYPE,
+    TORCH_TO_CUTE_DTYPE,
+    LowBitType,
+    mma_sync_mxf8f6f4,
+    permute,
+    simple_tma_g2s,
+    tma_g2s,
+)
 
 
-class Sm120MatmulMXFP8:
+class Sm120MatmulMXF8F6F4:
     cta_tile = (128, 128, 128)
     warp_layout = (2, 2)
     num_stages = 2
 
+    def __init__(self, a_type: LowBitType, b_type: LowBitType):
+        self.a_type = a_type
+        self.b_type = b_type
+
     @cute.jit
-    def prepare_AB(self, A: cute.Tensor, BM: cutlass.Constexpr, BK: cutlass.Constexpr):
-        tma_op = cpasync.CopyBulkTensorTileG2SOp()
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
+    def prepare_AB(self, A: cute.Tensor, BM: int, BK: int):
+        """NOTE: BK is in unit of bytes, not elements"""
+        # <3,4,3> for 128B, <2,4,3> for 64B
+        swizzle = cute.make_swizzle(int(math.log2(BK // 16)), 4, 3)
         s_layout = cute.make_layout((BM, BK, self.num_stages), stride=(BK, 1, BM * BK))
-        s_layout = cute.make_composed_layout(swizzle_128B, 0, s_layout)
-        return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK))
+        s_layout = cute.make_composed_layout(swizzle, 0, s_layout)
+
+        # it's not obvious but when we use FP4/FP6 with internal_type=U8, CuteDSL
+        # will use CU_TENSOR_MAP_DATA_TYPE_16U4/U6_ALIGN16B for TMA
+        tma_op = cpasync.CopyBulkTensorTileG2SOp()
+        return cpasync.make_tiled_tma_atom(tma_op, A, s_layout, (BM, BK), internal_type=Uint8)
 
     @cute.jit
     def __call__(
@@ -39,8 +58,8 @@ class Sm120MatmulMXFP8:
         N, _ = gB.shape
         BM, BN, BK = self.cta_tile
 
-        A_tma = self.prepare_AB(gA, BM, BK)
-        B_tma = self.prepare_AB(gB, BN, BK)
+        A_tma = self.prepare_AB(cute.recast_tensor(gA, PTX_TO_CUTE_DTYPE[self.a_type]), BM, BK)
+        B_tma = self.prepare_AB(cute.recast_tensor(gB, PTX_TO_CUTE_DTYPE[self.b_type]), BN, BK)
 
         grid = (cute.ceil_div(M, BM), cute.ceil_div(N, BN), 1)
         num_warps = math.prod(self.warp_layout) + 1
@@ -72,8 +91,8 @@ class Sm120MatmulMXFP8:
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
-        sA = smem.allocate_tensor(Float8E4M3FN, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
-        sB = smem.allocate_tensor(Float8E4M3FN, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
+        sA = smem.allocate_tensor(Uint8, sA_layout.outer, byte_alignment=128, swizzle=sA_layout.inner)
+        sB = smem.allocate_tensor(Uint8, sB_layout.outer, byte_alignment=128, swizzle=sB_layout.inner)
 
         sf_slayout = cute.make_layout(((4, 4, 32), num_stages))
         sSFA = smem.allocate_tensor(Float8E8M0FNU, sf_slayout, byte_alignment=128)
@@ -114,7 +133,9 @@ class Sm120MatmulMXFP8:
                 cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
 
                 with cute.arch.elect_one():
-                    STAGE_SIZE = (BM + BN) * (BK + BK // 32)
+                    BK_A = BK // 8 * PTX_TO_CUTE_DTYPE[self.a_type].width
+                    BK_B = BK // 8 * PTX_TO_CUTE_DTYPE[self.b_type].width
+                    STAGE_SIZE = BM * BK_A + BN * BK_B + (BM + BN) * (BK // 32)
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
                 simple_tma_g2s(A_tma.atom, gA_tiles[None, None, iter_k], sA[None, None, tma_stage], mbar)
                 simple_tma_g2s(B_tma.atom, gB_tiles[None, None, iter_k], sB[None, None, tma_stage], mbar)
@@ -145,6 +166,7 @@ class Sm120MatmulMXFP8:
 
             # pre-compute ldmatrix address (16x16 tile)
             # ((16, (16B, 2), 1), (WM/16, BK/32B, num_stages))
+            # custom stride for fp6 and fp4
             elems = 16  # 16B
             sA_ldsm = cute.zipped_divide(sA_warp, (16, cute.make_layout((elems, 2))))
             sB_ldsm = cute.zipped_divide(sB_warp, (16, cute.make_layout((elems, 2))))
@@ -154,9 +176,16 @@ class Sm120MatmulMXFP8:
             sA_ldsm = sA_ldsm[(lane_id % 16, (None, lane_id // 16)), None]
             sB_ldsm = sB_ldsm[((lane_id // 16) * 8 + (lane_id % 8), (None, (lane_id // 8) % 2)), None]
 
-            # ldmatrix.x4
-            ldsm_op = warp.LdMatrix8x8x16bOp(num_matrices=4)
-            ldsm_atom = cute.make_copy_atom(ldsm_op, Float8E4M3FN)
+            # ldmatrix
+            def get_s2r_atom(dtype: LowBitType):
+                if cutlass.const_expr(dtype in ("e5m2", "e4m3")):
+                    op = warp.LdMatrix8x8x16bOp(num_matrices=4)
+                else:
+                    op = warp.LdMatrix8x16x8bOp(num_matrices=4, unpack_bits=PTX_TO_CUTE_DTYPE[dtype].width)
+                return cute.make_copy_atom(op, Uint8)
+
+            A_s2r_atom = get_s2r_atom(self.a_type)
+            B_s2r_atom = get_s2r_atom(self.b_type)
 
             # select SF smem
             # logically, it looks like [32x4][32x4][32x4][32x4]
@@ -175,8 +204,8 @@ class Sm120MatmulMXFP8:
             # registers
             # let ptxas decides register reuse for rA and rB
             MMA_K = 32  # 32B
-            rA = cute.make_rmem_tensor((16, WM // 16, BK // MMA_K), Float8E4M3FN)
-            rB = cute.make_rmem_tensor(((8, 2), WN // 16, BK // MMA_K), Float8E4M3FN)
+            rA = cute.make_rmem_tensor((16, WM // 16, BK // MMA_K), Uint8)
+            rB = cute.make_rmem_tensor(((8, 2), WN // 16, BK // MMA_K), Uint8)
             rC = cute.make_rmem_tensor((4, WN // 8, WM // 16), Float32)
             rC.fill(0.0)
 
@@ -193,12 +222,23 @@ class Sm120MatmulMXFP8:
                 cute.copy(sf_s2r_atom, sSFB_view[None, tma_stage], rSFB)
 
                 for k in cutlass.range_constexpr(BK // MMA_K):
-                    cute.copy(ldsm_atom, sA_ldsm[None, (None, k, tma_stage)], rA[None, None, k])
-                    cute.copy(ldsm_atom, sB_ldsm[None, (None, k, tma_stage)], rB[None, None, k])
+                    cute.copy(A_s2r_atom, sA_ldsm[None, (None, k, tma_stage)], rA[None, None, k])
+                    cute.copy(B_s2r_atom, sB_ldsm[None, (None, k, tma_stage)], rB[None, None, k])
+
+                    # ldmatrix loads fp4 as 0000xxxx, but mma wants 00xxxx00
+                    if cutlass.const_expr(self.a_type == "e2m1"):
+                        rA_view = cute.recast_tensor(rA[None, None, k], Int32)
+                        for i in cutlass.range_constexpr(cute.size(rA_view)):
+                            rA_view[i] <<= 2
+
+                    if cutlass.const_expr(self.b_type == "e2m1"):
+                        rB_view = cute.recast_tensor(rB[None, None, k], Int32)
+                        for i in cutlass.range_constexpr(cute.size(rB_view)):
+                            rB_view[i] <<= 2
 
                     for m in cutlass.range_constexpr(WM // 16):
                         for n in cutlass.range_constexpr(WN // 8):
-                            rC[None, n, m] = mma_sync_mxfp8(
+                            rC[None, n, m] = mma_sync_mxf8f6f4(
                                 rA[None, m, k],
                                 rB[(None, n % 2), n // 2, k],
                                 rC[None, n, m],
@@ -208,6 +248,8 @@ class Sm120MatmulMXFP8:
                                 rSFB[n // 4],
                                 Int16(k),
                                 Int16(n % 4),
+                                a_type=self.a_type,
+                                b_type=self.b_type,
                             )
 
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -241,23 +283,44 @@ class Sm120MatmulMXFP8:
 
     @cache
     @staticmethod
-    def compile():
+    def compile(a_type: LowBitType, b_type: LowBitType):
         M = cute.sym_int()
         N = cute.sym_int()
-        K = cute.sym_int()
+        K = cute.sym_int(divisibility=2)
 
-        A = make_fake_tensor(Float8E4M3FN, (M, K), (cute.sym_int64(16), 1), assumed_align=16)
-        B = make_fake_tensor(Float8E4M3FN, (N, K), (cute.sym_int64(16), 1), assumed_align=16)
+        K_A = K // 8 * PTX_TO_CUTE_DTYPE[a_type].width
+        K_B = K // 8 * PTX_TO_CUTE_DTYPE[b_type].width
+
+        A = make_fake_tensor(Uint8, (M, K_A), (cute.sym_int64(16), 1), assumed_align=16)
+        B = make_fake_tensor(Uint8, (N, K_B), (cute.sym_int64(16), 1), assumed_align=16)
         SFA = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
         SFB = make_fake_tensor(Float8E8M0FNU, (cute.sym_int(divisibility=512),), (1,), assumed_align=16)
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
 
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm120MatmulMXFP8()
+        kernel = Sm120MatmulMXF8F6F4(a_type, b_type)
         return cute.compile(kernel, A, B, SFA, SFB, C, stream, options="--enable-tvm-ffi")
 
 
-def mm(A: torch.Tensor, B: torch.Tensor, SFA: torch.Tensor, SFB: torch.Tensor):
+def mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    SFA: torch.Tensor,
+    SFB: torch.Tensor,
+    *,
+    a_type: LowBitType | None = None,
+    b_type: LowBitType | None = None,
+):
+    # autodetect
+    ALLOWED_TORCH_TYPES = (torch.float8_e5m2, torch.float8_e4m3fn, torch.float4_e2m1fn_x2)
+    if a_type is None:
+        assert A.dtype in ALLOWED_TORCH_TYPES
+        a_type = CUTE_TO_PTX_DTYPE[TORCH_TO_CUTE_DTYPE[A.dtype]]
+    if b_type is None:
+        assert B.dtype in ALLOWED_TORCH_TYPES
+        b_type = CUTE_TO_PTX_DTYPE[TORCH_TO_CUTE_DTYPE[B.dtype]]
+
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
-    Sm120MatmulMXFP8.compile()(A, B, SFA.view(-1), SFB.view(-1), C)
+    kernel = Sm120MatmulMXF8F6F4.compile(a_type, b_type)
+    kernel(A.view(torch.uint8), B.view(torch.uint8), SFA.view(-1), SFB.view(-1), C)
     return C

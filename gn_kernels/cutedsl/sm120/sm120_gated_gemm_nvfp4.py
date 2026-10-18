@@ -16,16 +16,15 @@ from ..utils import mma_sync_nvfp4, permute, simple_tma_g2s, tma_g2s
 
 @dsl_user_op
 def _f32x8_to_f4x8(x: cute.Tensor, *, loc=None, ip=None) -> Uint32:
-    # NOTE: lower elem is stored as higher nibble
     out = llvm.inline_asm(
         T.i32(),
         [x[i].ir_value(loc=loc, ip=ip) for i in range(8)],
         "{\n"
         ".reg .b8 x0, x1, x2, x3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 x0, $1, $2;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 x1, $3, $4;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 x2, $5, $6;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 x3, $7, $8;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 x0, $2, $1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 x1, $4, $3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 x2, $6, $5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 x3, $8, $7;\n"
         "mov.b32 $0, {x0, x1, x2, x3};\n"
         "}",
         "=r,f,f,f,f,f,f,f,f",

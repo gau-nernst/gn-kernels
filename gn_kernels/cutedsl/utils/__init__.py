@@ -1,3 +1,5 @@
+from typing import Literal
+
 import cutlass
 import torch
 from cutlass import Int16, Int32, Int64, cute
@@ -10,25 +12,31 @@ TORCH_TO_CUTE_DTYPE = {
     torch.float32: cutlass.Float32,
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e5m2: cutlass.Float8E5M2,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
     torch.int8: cutlass.Int8,
     torch.uint8: cutlass.Uint8,
     torch.int32: cutlass.Int32,
     torch.uint32: cutlass.Uint32,
 }
-
 CUTE_TO_PTX_DTYPE = {
     cutlass.Float32: "f32",
     cutlass.BFloat16: "bf16",
     cutlass.Float16: "f16",
-    cutlass.Float8E4M3FN: "e4m3",
     cutlass.Float8E5M2: "e5m2",
+    cutlass.Float8E4M3FN: "e4m3",
+    cutlass.Float6E3M2FN: "e3m2",
+    cutlass.Float6E2M3FN: "e2m3",
+    cutlass.Float4E2M1FN: "e2m1",
     cutlass.Int8: "s8",
     cutlass.Uint8: "u8",
     cutlass.Int32: "s32",
     cutlass.Uint32: "u32",
 }
+PTX_TO_CUTE_DTYPE = {v: k for k, v in CUTE_TO_PTX_DTYPE.items()}
+
+LowBitType = Literal["e5m2", "e4m3", "e3m2", "e2m3", "e2m1"]
 
 # https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
 EVICT_NORMAL = Int64(0x1000000000000000)
@@ -108,7 +116,7 @@ def mma_sync(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=Non
 
 
 @dsl_user_op
-def mma_sync_mxfp8(
+def mma_sync_mxf8f6f4(
     a: cute.Tensor,
     b: cute.Tensor,
     c: cute.Tensor,
@@ -119,6 +127,8 @@ def mma_sync_mxfp8(
     byte_id_B: Int16,
     thread_id_B: Int16,
     *,
+    a_type: LowBitType,
+    b_type: LowBitType,
     loc=None,
     ip=None,
 ):
@@ -133,7 +143,7 @@ def mma_sync_mxfp8(
         + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)]
         + [SFA.ir_value(loc=loc, ip=ip), byte_id_A.ir_value(loc=loc, ip=ip), thread_id_A.ir_value(loc=loc, ip=ip)]
         + [SFB.ir_value(loc=loc, ip=ip), byte_id_B.ir_value(loc=loc, ip=ip), thread_id_B.ir_value(loc=loc, ip=ip)],
-        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.e4m3.e4m3.f32.ue8m0 "
+        f"mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.f32.{a_type}.{b_type}.f32.ue8m0 "
         "{$0, $1, $2, $3}, "
         "{$4, $5, $6, $7}, "
         "{$8, $9}, "
@@ -161,7 +171,9 @@ def mma_sync_fp8(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, use_mxfp8: bool
         SF = Int32(127)
         byte_id = Int16(0)
         thread_id = Int16(0)
-        return mma_sync_mxfp8(a, b, c, SF, byte_id, thread_id, SF, byte_id, thread_id, loc=loc, ip=ip)
+        return mma_sync_mxf8f6f4(
+            a, b, c, SF, byte_id, thread_id, SF, byte_id, thread_id, a_type="e4m3", b_type="e4m3", loc=loc, ip=ip
+        )
     else:
         return mma_sync(a, b, c, loc=loc, ip=ip)
 
