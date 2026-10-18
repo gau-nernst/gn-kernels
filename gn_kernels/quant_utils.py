@@ -1,3 +1,6 @@
+import math
+from typing import Literal
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -6,15 +9,21 @@ from torch import Tensor
 
 DTYPE_AMAX_LUT = {
     torch.float4_e2m1fn_x2: 6.0,
+    "e2m3": 7.5,
+    "e3m2": 28.0,
     torch.float8_e4m3fn: 448.0,
     torch.float8_e5m2: 57_344.0,
 }
 
 DTYPE_POW2_AMAX_LUT = {
     torch.float4_e2m1fn_x2: 4.0,
+    "e2m3": 4.0,
+    "e3m2": 16.0,
     torch.float8_e4m3fn: 256.0,
     torch.float8_e5m2: 32_768.0,
 }
+
+FP6_Type = Literal["e2m3", "e3m2"]
 
 
 # https://github.com/NVIDIA/cutlass/blob/v3.9.2/media/docs/cpp/blackwell_functionality.md#scale-factor-layouts
@@ -59,39 +68,71 @@ def absmax_to_mx_scales_ocp(absmax: Tensor, dtype: torch.dtype):
     return ((absmax.view(torch.int32) & 0x7F80_0000).view(torch.float32) / dtype_pow2_amax).view(torch.int32) >> 23
 
 
-def fp32_to_fp4e2m1x2(x: Tensor):
+def generate_lut(e: int, m: int):
+    e_bias = (1 << (e - 1)) - 1
+    denormals = [math.ldexp(i, 1 - e_bias - m) for i in range(1 << m)]
+    normals = [math.ldexp(1.0 + i / (1 << m), j - e_bias) for j in range(1, 1 << e) for i in range(1 << m)]
+    pos = denormals + normals
+    neg = [-x for x in pos]
+    return pos + neg
+
+
+F6E3M2_LUT = generate_lut(3, 2)
+F6E2M3_LUT = generate_lut(2, 3)
+F4E2M1_LUT = generate_lut(2, 1)
+
+
+def f32_to_low_bit(x: Tensor, dtype: torch.dtype | FP6_Type):
     assert x.dtype == torch.float32
+
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return x.to(dtype)
 
     bits_f32 = x.view(torch.int32)
     sign = (bits_f32 >> 31) & 0x1
-
     x_abs = x.abs()
-    nosign = torch.where(x_abs <= 5.0, 0b0110, 0b0111).int()
-    nosign = torch.where(x_abs < 3.5, 0b0101, nosign)
-    nosign = torch.where(x_abs <= 2.5, 0b0100, nosign)
-    nosign = torch.where(x_abs < 1.75, 0b0011, nosign)
-    nosign = torch.where(x_abs <= 1.25, 0b0010, nosign)
-    nosign = torch.where(x_abs < 0.75, 0b0001, nosign)
-    nosign = torch.where(x_abs <= 0.25, 0b0000, nosign)
 
-    f4_e2m1 = (sign << 3) | nosign
+    # midpoints
+    lut = {torch.float4_e2m1fn_x2: F4E2M1_LUT, "e2m3": F6E2M3_LUT, "e3m2": F6E3M2_LUT}[dtype]
+    thresholds = []
+    for i in range(len(lut) // 2 - 1):
+        thresholds.append((lut[i] + lut[i + 1]) / 2)
 
-    # pack to 32-bit register
-    f4_e2m1x2 = (
-        f4_e2m1[..., 0::8]
-        | (f4_e2m1[..., 1::8] << 4)
-        | (f4_e2m1[..., 2::8] << 8)
-        | (f4_e2m1[..., 3::8] << 12)
-        | (f4_e2m1[..., 4::8] << 16)
-        | (f4_e2m1[..., 5::8] << 20)
-        | (f4_e2m1[..., 6::8] << 24)
-        | (f4_e2m1[..., 7::8] << 28)
-    )
-    return f4_e2m1x2.view(torch.float4_e2m1fn_x2)
+    # RTNE
+    nosign = torch.zeros(1, device=x.device, dtype=torch.int32)
+    for i, th in enumerate(thresholds):
+        cond = x_abs > th if i % 2 == 0 else x_abs >= th
+        nosign = torch.where(cond, i + 1, nosign)
+
+    if dtype == torch.float4_e2m1fn_x2:
+        f4 = (sign << 3) | nosign
+
+        # pack to 32-bit register
+        packed = (
+            f4[..., 0::8]
+            | (f4[..., 1::8] << 4)
+            | (f4[..., 2::8] << 8)
+            | (f4[..., 3::8] << 12)
+            | (f4[..., 4::8] << 16)
+            | (f4[..., 5::8] << 20)
+            | (f4[..., 6::8] << 24)
+            | (f4[..., 7::8] << 28)
+        )
+        return packed.view(torch.float4_e2m1fn_x2)
+
+    else:
+        f6 = (sign << 5) | nosign
+
+        # pack 4x fp6 as 3x uint8
+        # ddddddcc|ccccbbbb|bbaaaaaa
+        b0 = f6[..., 0::4] | ((f6[..., 1::4] & 3) << 6)
+        b1 = (f6[..., 1::4] >> 2) | ((f6[..., 2::4] & 0xF) << 4)
+        b2 = (f6[..., 2::4] >> 4) | (f6[..., 3::4] << 2)
+        return torch.stack([b0, b1, b2], dim=-1).flatten(-2).to(torch.uint8)
 
 
-def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"):
-    assert dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float4_e2m1fn_x2)
+def quantize_mx(x: Tensor, dtype: torch.dtype | FP6_Type, compute_scale_method: str = "ocp"):
+    assert dtype in (torch.float8_e5m2, torch.float8_e4m3fn, "e3m2", "e2m3", torch.float4_e2m1fn_x2)
     x_blocks_f32 = x.float().unflatten(-1, (-1, 32))  # [..., N/32, 32]
     blocks_amax = x_blocks_f32.abs().amax(dim=-1)  # [..., N/32]
 
@@ -108,35 +149,49 @@ def quantize_mx(x: Tensor, dtype: torch.dtype, compute_scale_method: str = "ocp"
     x_blocks_f32 = x_blocks_f32 / (block_scales_bits.unsqueeze(-1) << 23).view(torch.float32).clip(1e-12)
     x_blocks_f32 = x_blocks_f32.clip(-dtype_amax, dtype_amax)
 
-    if dtype == torch.float4_e2m1fn_x2:
-        xq = fp32_to_fp4e2m1x2(x_blocks_f32)
-    else:
-        xq = x_blocks_f32.to(dtype)
-    xq = xq.view(*x.shape[:-1], -1)
-
+    xq = f32_to_low_bit(x_blocks_f32, dtype).view(*x.shape[:-1], -1)
     return xq, scales
 
 
-def dequantize_mx(xq: Tensor, scales: Tensor):
+def dequantize_mx(xq: Tensor, scales: Tensor, dtype: FP6_Type | None = None):
     assert scales.dtype == torch.float8_e8m0fnu
 
     if xq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         return (xq.float().reshape(-1, 32) * scales.float().reshape(-1, 1)).view(xq.shape)
 
     elif xq.dtype == torch.float4_e2m1fn_x2:
-        FP4E2M1_LUT = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            device=xq.device,
-            dtype=torch.float32,
-        )
-
         # unpack
         xq_i32 = xq.view(torch.uint8).to(torch.int32)
         xq_unpacked = torch.stack([xq_i32 & 0xF, (xq_i32 >> 4) & 0xF], dim=-1).flatten(-2)
-        x = FP4E2M1_LUT[xq_unpacked]
+
+        # lookup
+        lut = torch.tensor(F4E2M1_LUT, device=xq.device, dtype=torch.float32)
+        x = lut[xq_unpacked]
 
         scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-        x_scaled = x.unflatten(-1, (xq.shape[-1] // 16, 32)) * scales_f32.unsqueeze(-1)
+        x_scaled = x.unflatten(-1, (-1, 32)) * scales_f32.unsqueeze(-1)
+        return x_scaled.view(*xq.shape[:-1], -1)
+
+    else:
+        assert xq.dtype == torch.uint8
+        assert dtype is not None
+
+        # unpack 3x uint8 to 4x fp6
+        # ddddddcc|ccccbbbb|bbaaaaaa
+        mask = (1 << 6) - 1
+        xq_i32 = xq.to(torch.int32)
+        x0 = xq_i32[..., 0::3] & mask
+        x1 = (xq_i32[..., 0::3] >> 6) | ((xq_i32[..., 1::3] << 2) & mask)
+        x2 = (xq_i32[..., 1::3] >> 4) | ((xq_i32[..., 2::3] << 4) & mask)
+        x3 = xq_i32[..., 2::3] >> 2
+        xq_unpacked = torch.stack([x0, x1, x2, x3], dim=-1).flatten(-2)
+
+        # lookup
+        lut = torch.tensor(dict(e3m2=F6E3M2_LUT, e2m3=F6E2M3_LUT)[dtype], device=xq.device, dtype=torch.float32)
+        x = lut[xq_unpacked]
+
+        scales_f32 = (scales.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+        x_scaled = x.unflatten(-1, (-1, 32)) * scales_f32.unsqueeze(-1)
         return x_scaled.view(*xq.shape[:-1], -1)
 
 
@@ -154,7 +209,7 @@ def quantize_nvfp4(x: Tensor, tensor_scale: Tensor | None = None, eps: float = 1
     scales = scales_f32.clip(-448.0, 448.0).to(torch.float8_e4m3fn)
 
     x_blocks_f32 = x_blocks_f32 / (tensor_scale * scales.float()).unsqueeze(-1).clip(eps)
-    xq = fp32_to_fp4e2m1x2(x_blocks_f32).view(x.shape[0], -1)
+    xq = f32_to_low_bit(x_blocks_f32, torch.float4_e2m1fn_x2).view(x.shape[0], -1)
 
     return xq, scales, tensor_scale
 

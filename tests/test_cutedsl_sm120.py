@@ -49,19 +49,29 @@ def test_mm_fp8():
     torch.testing.assert_close(out, ref)
 
 
-@pytest.mark.parametrize("a_dtype", ["e4m3", "e2m1"])
-@pytest.mark.parametrize("b_dtype", ["e4m3", "e2m1"])
-def test_mm_mxf8f6f4(a_dtype: torch.dtype, b_dtype: torch.dtype):
+@pytest.mark.parametrize("a_dtype", [torch.float8_e4m3fn, "e2m3", torch.float4_e2m1fn_x2])
+@pytest.mark.parametrize("b_dtype", [torch.float8_e4m3fn, "e2m3", torch.float4_e2m1fn_x2])
+def test_mm_mxf8f6f4(a_dtype: torch.dtype | str, b_dtype: torch.dtype | str):
     M, N, K = 128, 256, 256
 
-    def make_input(M: int, N: int, dtype: torch.dtype):
+    def make_input(M: int, N: int, dtype: str):
         x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * (K**-0.5)
-        return quantize_mx(x, dict(e4m3=torch.float8_e4m3fn, e2m1=torch.float4_e2m1fn_x2)[dtype])
+        return quantize_mx(x, dtype)
 
     X, Xsf = make_input(M, K, a_dtype)
     W, Wsf = make_input(N, K, b_dtype)
-    out = sm120_mm_mxf8f6f4.mm(X, W, permute_nv_sf(Xsf), permute_nv_sf(Wsf))
-    ref = (dequantize_mx(X, Xsf) @ dequantize_mx(W, Wsf).T).to(torch.bfloat16)
+    out = sm120_mm_mxf8f6f4.mm(
+        X,
+        W,
+        permute_nv_sf(Xsf),
+        permute_nv_sf(Wsf),
+        a_type="e2m3" if a_dtype == "e2m3" else None,
+        b_type="e2m3" if b_dtype == "e2m3" else None,
+    )
+    if a_dtype == b_dtype == torch.float8_e4m3fn:
+        ref = mxfp8_mm(X, permute_nv_sf(Xsf), W, permute_nv_sf(Wsf))
+    else:
+        ref = (dequantize_mx(X, Xsf, a_dtype) @ dequantize_mx(W, Wsf, b_dtype).T).to(torch.bfloat16)
     torch.testing.assert_close(out, ref)
 
 
