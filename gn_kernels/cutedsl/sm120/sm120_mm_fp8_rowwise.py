@@ -187,14 +187,12 @@ class Sm120Fp8RowwiseMatmul:
                     parity ^= 1
 
             # epilogue
-            # row scales. skip out-of-bounds rows: C is over-allocated, so their outputs are discarded.
+            # row scales. clamp out-of-bounds rows: C is over-allocated, so their outputs are discarded.
             rSA = cute.make_rmem_tensor((2, WM // 16), Float32)
             for m in cutlass.range_constexpr(WM // 16):
                 off_m = bid_m * BM + warp_id_m * WM + m * 16 + (lane_id // 4)
-                if off_m < M:
-                    rSA[0, m] = gSA[off_m].to(Float32)
-                if off_m + 8 < M:
-                    rSA[1, m] = gSA[off_m + 8].to(Float32)
+                rSA[0, m] = gSA[min(off_m + 0, M - 1)].to(Float32)
+                rSA[1, m] = gSA[min(off_m + 8, M - 1)].to(Float32)
 
             # column scales. N is a multiple of BN, no bounds check.
             rSB = cute.make_rmem_tensor((2, WN // 8), Float32)
@@ -203,20 +201,12 @@ class Sm120Fp8RowwiseMatmul:
                 rSB[0, n] = gSB[off_n + 0].to(Float32)
                 rSB[1, n] = gSB[off_n + 1].to(Float32)
 
-            # apply row scales first, so that they don't wait for column scales
             for m in cutlass.range_constexpr(WM // 16):
                 for n in cutlass.range_constexpr(WN // 8):
-                    rC[0, n, m] *= rSA[0, m]
-                    rC[1, n, m] *= rSA[0, m]
-                    rC[2, n, m] *= rSA[1, m]
-                    rC[3, n, m] *= rSA[1, m]
-
-            for m in cutlass.range_constexpr(WM // 16):
-                for n in cutlass.range_constexpr(WN // 8):
-                    rC[0, n, m] *= rSB[0, n]
-                    rC[1, n, m] *= rSB[1, n]
-                    rC[2, n, m] *= rSB[0, n]
-                    rC[3, n, m] *= rSB[1, n]
+                    rC[0, n, m] *= rSA[0, m] * rSB[0, n]
+                    rC[1, n, m] *= rSA[0, m] * rSB[1, n]
+                    rC[2, n, m] *= rSA[1, m] * rSB[0, n]
+                    rC[3, n, m] *= rSA[1, m] * rSB[1, n]
 
             cp_op = nvgpu.CopyUniversalOp()
             cp_atom = cute.make_copy_atom(cp_op, BFloat16, num_bits_per_copy=32)
