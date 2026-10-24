@@ -6,6 +6,7 @@ from gn_kernels.cutedsl.sm120 import (
     sm120_gated_gemm_nvfp4,
     sm120_mm,
     sm120_mm_fp8_1d2d,
+    sm120_mm_fp8_rowwise,
     sm120_mm_mxf8f6f4,
     sm120_mm_nvfp4,
 )
@@ -89,6 +90,25 @@ def test_mm_nvfp4():
     s = torch.ones(1, device="cuda")
     out = sm120_mm_nvfp4.mm(X, W, Xsf, Wsf)
     ref = nvfp4_mm(X, Xsf, s, W, Wsf, s)
+    torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("M", [128, 200, 1000])
+@pytest.mark.parametrize(
+    "scale_dtypes",
+    [(torch.float32, torch.float32), (torch.bfloat16, torch.bfloat16), (torch.float32, torch.bfloat16)],
+)
+def test_mm_fp8_rowwise(M: int, scale_dtypes):
+    N, K = 512, 512
+    Xs_dtype, Ws_dtype = scale_dtypes
+
+    X = torch.randn(M, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
+    Xs = (torch.rand(M, 1, device="cuda") + 0.5).to(Xs_dtype)
+    W = torch.randn(N, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
+    Ws = (torch.rand(1, N, device="cuda") + 0.5).to(Ws_dtype)
+
+    out = sm120_mm_fp8_rowwise.mm(X, Xs, W, Ws)
+    ref = F.scaled_mm(X, W.T, Xs.float(), F.ScalingType.RowWise, Ws.float(), F.ScalingType.RowWise)
     torch.testing.assert_close(out, ref)
 
 
