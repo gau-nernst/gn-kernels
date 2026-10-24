@@ -94,15 +94,26 @@ def test_mm_nvfp4():
 
 
 @pytest.mark.parametrize("M", [128, 200, 1000])
-def test_mm_fp8_rowwise(M: int):
-    N, K = 256, 512
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,  # heuristic
+        ((128, 256, 128), (2, 4), 2),
+        ((128, 128, 128), (4, 2), 2),
+        ((64, 128, 128), (2, 2), 3),
+        ((64, 64, 128), (2, 2), 4),
+    ],
+)
+def test_mm_fp8_rowwise(M: int, config):
+    N, K = 512, 512
+    cta_tile, warp_layout, num_stages = config or (None, None, None)
 
     X = torch.randn(M, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
     Xs = torch.rand(M, 1, device="cuda") + 0.5
     W = torch.randn(N, K, device="cuda").mul(10).to(torch.float8_e4m3fn)
     Ws = torch.rand(1, N, device="cuda") + 0.5
 
-    out = sm120_mm_fp8_rowwise.mm(X, Xs, W, Ws)
+    out = sm120_mm_fp8_rowwise.mm(X, Xs, W, Ws, cta_tile=cta_tile, warp_layout=warp_layout, num_stages=num_stages)
     ref = F.scaled_mm(X, W.T, Xs, F.ScalingType.RowWise, Ws, F.ScalingType.RowWise)
     torch.testing.assert_close(out, ref)
 
