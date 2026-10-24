@@ -20,7 +20,7 @@ class Sm120Fp8RowwiseMatmul:
         cta_tile: tuple[int, int, int] = (128, 128, 128),
         warp_layout: tuple[int, int] = (4, 2),
         num_stages: int = 2,
-        group_m: int = 8,
+        group_m: int = 1,
     ) -> None:
         self.cta_tile = cta_tile
         self.warp_layout = warp_layout
@@ -291,7 +291,7 @@ def mm(
     cta_tile: tuple[int, int, int] | None = None,
     warp_layout: tuple[int, int] | None = None,
     num_stages: int | None = None,
-    group_m: int = 8,
+    group_m: int = 1,
 ):
     # A: [M, K] FP8, SA: [M] or [M, 1] FP32
     # B: [N, K] FP8, SB: [N] or [1, N] FP32
