@@ -276,7 +276,7 @@ def select_config(M: int, N: int, K: int) -> tuple[tuple[int, int, int], tuple[i
     if N % 256 == 0 and grid_m128 * (N // 256) >= 0.5 * num_sms:
         return (128, 256, 128), (2, 4), 2
     if grid_m128 * (N // 128) >= 0.5 * num_sms:
-        return (128, 128, 128), (4, 2), 2
+        return (128, 128, 128), (2, 2), 2
     if grid_m64 * (N // 128) >= 0.4 * num_sms:
         return (64, 128, 128), (2, 2), 3
     return (64, 64, 128), (2, 2), 4
