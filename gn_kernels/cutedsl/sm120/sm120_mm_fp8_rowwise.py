@@ -9,23 +9,16 @@ from cutlass.cute import nvgpu
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
-from ..utils import mma_sync_fp8, permute, simple_tma_g2s
+from ..utils import TORCH_TO_CUTE_DTYPE, mma_sync_fp8, permute, simple_tma_g2s
 
 
 class Sm120Fp8RowwiseMatmul:
-    """C = (A @ B.T) * SA[:, None] * SB[None, :], with FP8 A/B and FP32 row-wise scales"""
+    """C = (A @ B.T) * SA[:, None] * SB[None, :], with FP8 A/B and FP32/BF16 row-wise scales"""
 
-    def __init__(
-        self,
-        cta_tile: tuple[int, int, int] = (128, 128, 128),
-        warp_layout: tuple[int, int] = (4, 2),
-        num_stages: int = 2,
-        group_m: int = 1,
-    ) -> None:
+    def __init__(self, cta_tile: tuple[int, int, int], warp_layout: tuple[int, int], num_stages: int) -> None:
         self.cta_tile = cta_tile
         self.warp_layout = warp_layout
         self.num_stages = num_stages
-        self.group_m = group_m
         # FP8 mma with FP32 accumulate is half-rate on GeForce. use MXFP8 mma with unit scales instead.
         self.use_mxfp8_mma = "GeForce RTX 50" in torch.cuda.get_device_name()
 
@@ -86,19 +79,10 @@ class Sm120Fp8RowwiseMatmul:
         sA_layout = A_tma.smem_layout
         sB_layout = B_tma.smem_layout
 
-        grid_m = cute.ceil_div(M, BM)
+        # row-major raster. grouped raster (GROUP_M >= 8) is slower for large N.
         grid_n = cute.ceil_div(N, BN)
-        GROUP_M = self.group_m
-        if cutlass.const_expr(GROUP_M == 1):
-            bid_n = bid % grid_n
-            bid_m = bid // grid_n
-        else:
-            group_size = GROUP_M * grid_n
-            group_id = bid // group_size
-            excess = bid % group_size
-            group_m = min(grid_m - group_id * GROUP_M, GROUP_M)
-            bid_m = group_id * GROUP_M + excess % group_m
-            bid_n = excess // group_m
+        bid_n = bid % grid_n
+        bid_m = bid // grid_n
 
         # allocate smem
         smem = cutlass.utils.SmemAllocator()
@@ -207,15 +191,15 @@ class Sm120Fp8RowwiseMatmul:
             rSA = cute.make_rmem_tensor((2, WM // 16), Float32)
             for m in cutlass.range_constexpr(WM // 16):
                 off_m = bid_m * BM + warp_id_m * WM + m * 16 + (lane_id // 4)
-                rSA[0, m] = gSA[min(off_m + 0, M - 1)]
-                rSA[1, m] = gSA[min(off_m + 8, M - 1)]
+                rSA[0, m] = gSA[min(off_m + 0, M - 1)].to(Float32)
+                rSA[1, m] = gSA[min(off_m + 8, M - 1)].to(Float32)
 
             # column scales. N is a multiple of BN, no bounds check.
             rSB = cute.make_rmem_tensor((2, WN // 8), Float32)
             for n in cutlass.range_constexpr(WN // 8):
                 off_n = bid_n * BN + warp_id_n * WN + n * 8 + (lane_id % 4) * 2
-                rSB[0, n] = gSB[off_n + 0]
-                rSB[1, n] = gSB[off_n + 1]
+                rSB[0, n] = gSB[off_n + 0].to(Float32)
+                rSB[1, n] = gSB[off_n + 1].to(Float32)
 
             for m in cutlass.range_constexpr(WM // 16):
                 for n in cutlass.range_constexpr(WN // 8):
@@ -247,74 +231,56 @@ class Sm120Fp8RowwiseMatmul:
 
     @cache
     @staticmethod
-    def compile(cta_tile: tuple[int, int, int], warp_layout: tuple[int, int], num_stages: int, group_m: int):
+    def compile(
+        cta_tile: tuple[int, int, int],
+        warp_layout: tuple[int, int],
+        num_stages: int,
+        SA_dtype: torch.dtype,
+        SB_dtype: torch.dtype,
+    ):
         M = cute.sym_int()
         N = cute.sym_int()
         K = cute.sym_int()
 
         A = make_fake_tensor(Float8E4M3FN, (M, K), (cute.sym_int64(16), 1), assumed_align=16)
         B = make_fake_tensor(Float8E4M3FN, (N, K), (cute.sym_int64(16), 1), assumed_align=16)
-        SA = make_fake_tensor(Float32, (M,), (1,), assumed_align=4)
-        SB = make_fake_tensor(Float32, (N,), (1,), assumed_align=4)
+        SA = make_fake_tensor(TORCH_TO_CUTE_DTYPE[SA_dtype], (M,), (1,), assumed_align=2)
+        SB = make_fake_tensor(TORCH_TO_CUTE_DTYPE[SB_dtype], (N,), (1,), assumed_align=2)
         C = make_fake_tensor(BFloat16, (M, N), (cute.sym_int64(8), 1), assumed_align=16)
 
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm120Fp8RowwiseMatmul(cta_tile, warp_layout, num_stages, group_m)
+        kernel = Sm120Fp8RowwiseMatmul(cta_tile, warp_layout, num_stages)
         return cute.compile(kernel, A, SA, B, SB, C, stream, options="--enable-tvm-ffi")
 
 
-@cache
-def _num_sms() -> int:
-    return torch.cuda.get_device_properties().multi_processor_count
-
-
-def select_config(M: int, N: int, K: int) -> tuple[tuple[int, int, int], tuple[int, int], int]:
-    # pick the largest tile that still fills ~half a wave. tuned on RTX 5090 with a small sweep.
-    num_sms = _num_sms()
-    grid_m64 = (M + 63) // 64
-    grid_m128 = (M + 127) // 128
-    if N % 256 == 0 and grid_m128 * (N // 256) >= 0.5 * num_sms:
-        return (128, 256, 128), (2, 4), 2
-    if grid_m128 * (N // 128) >= 0.5 * num_sms:
-        return (128, 128, 128), (2, 2), 2
-    if grid_m64 * (N // 128) >= 0.4 * num_sms:
-        return (64, 128, 128), (2, 2), 3
-    return (64, 64, 128), (2, 2), 4
-
-
-def mm(
-    A: torch.Tensor,
-    SA: torch.Tensor,
-    B: torch.Tensor,
-    SB: torch.Tensor,
-    *,
-    cta_tile: tuple[int, int, int] | None = None,
-    warp_layout: tuple[int, int] | None = None,
-    num_stages: int | None = None,
-    group_m: int = 1,
-):
-    # A: [M, K] FP8, SA: [M] or [M, 1] FP32
-    # B: [N, K] FP8, SB: [N] or [1, N] FP32
-    # cta_tile, warp_layout and num_stages default to select_config()
+def mm(A: torch.Tensor, SA: torch.Tensor, B: torch.Tensor, SB: torch.Tensor):
+    # A: [M, K] FP8, SA: [M] or [M, 1] FP32/BF16
+    # B: [N, K] FP8, SB: [N] or [1, N] FP32/BF16
     M, K = A.shape
     N = B.shape[0]
     assert K % 128 == 0 and N % 128 == 0
 
-    default_tile, default_warp_layout, default_num_stages = select_config(M, N, K)
-    cta_tile = cta_tile or default_tile
-    warp_layout = warp_layout or default_warp_layout
-    num_stages = num_stages or default_num_stages
-    BM, BN, BK = cta_tile
-    assert K % BK == 0 and N % BN == 0
-
     SA = SA.reshape(M)
     SB = SB.reshape(N)
-    assert SA.dtype == SB.dtype == torch.float32
+    assert SA.dtype in (torch.float32, torch.bfloat16) and SB.dtype in (torch.float32, torch.bfloat16)
     assert SA.is_contiguous() and SB.is_contiguous()
 
+    # heuristic: pick the largest tile that still fills ~half a wave. tuned on RTX 5090 with a small sweep.
+    num_sms = torch.cuda.get_device_properties().multi_processor_count
+    grid_m64 = (M + 63) // 64
+    grid_m128 = (M + 127) // 128
+    if N % 256 == 0 and grid_m128 * (N // 256) >= 0.5 * num_sms:
+        cta_tile, warp_layout, num_stages = (128, 256, 128), (2, 4), 2
+    elif grid_m128 * (N // 128) >= 0.5 * num_sms:
+        cta_tile, warp_layout, num_stages = (128, 128, 128), (2, 2), 2
+    elif grid_m64 * (N // 128) >= 0.4 * num_sms:
+        cta_tile, warp_layout, num_stages = (64, 128, 128), (2, 2), 3
+    else:
+        cta_tile, warp_layout, num_stages = (64, 64, 128), (2, 2), 4
+
     # over-allocate to avoid predicate stores
-    grid_m = (M + BM - 1) // BM
-    C = A.new_empty(grid_m * BM, N, dtype=torch.bfloat16)[:M]
-    kernel = Sm120Fp8RowwiseMatmul.compile(tuple(cta_tile), tuple(warp_layout), num_stages, group_m)
+    BM = cta_tile[0]
+    C = A.new_empty((M + BM - 1) // BM * BM, N, dtype=torch.bfloat16)[:M]
+    kernel = Sm120Fp8RowwiseMatmul.compile(cta_tile, warp_layout, num_stages, SA.dtype, SB.dtype)
     kernel(A, SA, B, SB, C)
     return C
