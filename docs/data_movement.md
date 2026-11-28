@@ -149,6 +149,22 @@ LDG.E.ENL2.256 R4, R2, desc[UR4][R2.64], 0xc3
 LDG.E.ENL2.256 RZ, R8, desc[UR4][R2.64], 0xf
 ```
 
+## LDS and STS (`ld.shared::cta` / `st.shared::cta`)
+
+CUDA 13.1, sm_80–sm_120a.
+
+1–16 bytes only (no 256-bit), same width suffixes and register layout as legacy `LDG`/`STG`, with no `.E`, `desc[...]`, or cache modifiers:
+
+```
+LDS.128 R4, [R0+UR4+0x20]
+STS.128 [R0+UR4+0x20], R4
+```
+
+- **Addressing**: 32-bit `[R+imm]` or `[UR+imm]` (±8 MiB signed 24-bit imm), plus `[R+UR+imm]` on sm_90+.
+- **Memory ordering**:
+  - Because smem is uncached SRAM, `LDS`/`STS` instructions are already CTA-coherent — no `.STRONG.*` modifier and no `CCTL.IVALL`. Weak, `.relaxed.cta`, `.acquire.cta`, and `.volatile` all emit plain `LDS`/`STS`; `.release.cta` adds `MEMBAR.ALL.CTA` before `STS` to drain prior in-flight ops.
+  - Identical SASS does not make weak and strong equivalent in PTX: strong qualifiers still prevent `cicc`/`ptxas` from reordering, hoisting, or eliminating accesses.
+
 ## LDGSTS (`cp.async`)
 
 ### Cache mode and L2 cache hint
@@ -251,3 +267,69 @@ Benchmark (RTX 5090, µs per launch): copy-only `cp.async` kernel, no math. Each
 - Partial M: skipping beats zero-filling; the remap's L2 re-reads cost the most.
 - Unmasked is DRAM-bound (1.70 TB/s). At 1 valid row the in-bounds data stays in L2, so that row measures issue cost and L2 traffic.
 - Masks may still change the surrounding codegen in a real kernel (extra instructions, unrolling). If a masked build regresses, compare its k-loop SASS against an unmasked build.
+
+## LDSM and STSM (`ldmatrix` / `stmatrix`)
+
+CUDA 13.1, sm_80–sm_120a. `STSM` requires sm_90+. 8-bit and sub-byte unpack require sm_100+.
+
+`LDSM` addressing matches `LDS` (`[R+imm]`, `[UR+imm]`, and `[R+UR+imm]` on sm_90+); `STSM` uses `[R+imm]`.
+
+```
+// 16-bit load (sm_80+)
+LDSM.16.M88    R0, [R14+UR4]               // .m8n8.x1.b16
+LDSM.16.M88.4  R8, [R14+UR4+0x200]         // .m8n8.x4.b16
+LDSM.16.MT88.4 R4, [R14+UR4+0x400]         // .m8n8.x4.trans.b16
+
+// 16-bit store (sm_90+)
+STSM.16.MT88.4 [R0+0x400], R12             // .m8n8.x4.trans.b16
+
+// 8-bit transposed load+store (sm_100+)
+LDSM.8.MT1616.2  R12, [UR4+0x100]          // .m16n16.x2.trans.b8 (4 regs)
+
+// FP6 / FP4 -> 8-bit unpack (sm_100+): b6x16_p32 / b4x16_p64 -> b8x16
+LDSM.U6x16P32TO8.M816      R0, [UR4+0x200] // .m8n16.x1 (1 reg; .2/.4 exist)
+LDSM.U4x16P64TO8.MT1616.2  R8, [UR4+0x600] // .m16n16.x2.trans (4 regs)
+```
+
+## Distributed shared memory (sm_90+)
+
+CUDA 13.1, sm_90a–sm_120a.
+
+DSMEM does not use `LDS`/`STS`. A 32-bit `shared::cluster` address packs the target CTA rank into bits `[31:24]` and the CTA smem offset into bits `[23:0]` (16 MiB addressable, vs. 228 KiB max smem per CTA on Hopper/Blackwell).
+
+`mapa.shared::cluster.u32` (and `mapa.u64`, on the low 32 bits) lowers to a single `PRMT` / `UPRMT` — no need to hand-roll bit shifts:
+
+```
+// mapa.shared::cluster.u32 %r2, %r0 (off), %r1 (rank)
+// R5[31:24] = rank[7:0], R5[23:0] = off[23:0]
+PRMT R5, R5, 0x654, R4
+```
+
+**Synchronous `ld`/`st.shared::cluster`**: prepends special register `SR_SWINHI` (shared-memory virtual window high 32 bits, same as `cvta.shared`) to the 32-bit address to form a 64-bit generic pointer, then emits generic `LD.E`/`ST.E`.
+
+```
+S2UR UR6, SR_SWINHI
+UPRMT UR4, UR5, 0x654, UR4             // UR4 = low 32b (offset + cluster rank)
+UMOV UR5, UR6                          // UR5 = high 32b (SR_SWINHI)
+LD.E R0, [RZ.U32+UR4]                  // ld.shared::cluster (weak)
+```
+
+Cluster-scope ordering uses the same `.STRONG.GPU` / `CCTL.IVALL` / `MEMBAR.ALL.GPU` sequence as global memory (with GPU scope):
+
+```
+// ld.relaxed.cluster.shared::cluster
+LD.E.STRONG.GPU R5, [RZ.U32+UR4+0x4]
+
+// st.release.cluster.shared::cluster
+MEMBAR.ALL.GPU
+ERRBAR
+CGAERRBAR
+ST.E.STRONG.GPU [RZ.U32+UR4+0x10], R0
+```
+
+**Async `st.async.shared::cluster`**: lowers to a dedicated `STAS` instruction. It packs the 32-bit DSMEM data and mbarrier addresses into a register pair.
+
+```
+STAS     [R2.64], R8    // 4 B  (R2 = dst32, R3 = mbar32)
+STAS.128 [R4.64], R8    // 16 B (R4 = dst32, R5 = mbar32)
+```
